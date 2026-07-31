@@ -1001,10 +1001,12 @@ int mmc_select_bus_width(struct mmc_card *card)
 	static unsigned ext_csd_bits[] = {
 		EXT_CSD_BUS_WIDTH_8,
 		EXT_CSD_BUS_WIDTH_4,
+		EXT_CSD_BUS_WIDTH_1,
 	};
 	static unsigned bus_widths[] = {
 		MMC_BUS_WIDTH_8,
 		MMC_BUS_WIDTH_4,
+		MMC_BUS_WIDTH_1,
 	};
 	struct mmc_host *host = card->host;
 	unsigned idx, bus_width = 0;
@@ -1584,6 +1586,22 @@ int mmc_hs200_tuning(struct mmc_card *card)
 }
 EXPORT_SYMBOL_GPL(mmc_hs200_tuning);
 
+static void mmc_ffu_vh_update_cid_prv(struct mmc_host *host, struct mmc_card *card, u32 *cid)
+{
+	u8 raw_prv, prv;
+
+	raw_prv = (card->raw_cid[2] >> 16) & 0xff;
+	prv = (cid[2] >> 16) & 0xff;
+	if (unlikely((card->csd.mmca_vsn >= 2) && (raw_prv != prv))) {
+		pr_info("%s:(FFU) raw prv %x, prv %x\n", mmc_hostname(card->host),
+			raw_prv, prv);
+		card->raw_cid[2] &= 0xff00ffff;
+		card->raw_cid[2] |= prv << 16;
+
+		card->cid.prv = prv;
+	}
+}
+
 /*
  * Handle the detection and initialisation of a card.
  *
@@ -1635,6 +1653,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		goto err;
 
 	if (oldcard) {
+		mmc_ffu_vh_update_cid_prv(host, oldcard, cid);
 		trace_android_vh_mmc_ffu_update_cid(host, oldcard, cid);
 		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0) {
 			pr_debug("%s: Perhaps the card was replaced\n",

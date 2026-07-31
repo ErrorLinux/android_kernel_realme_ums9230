@@ -36,6 +36,13 @@
 
 #include "sdhci.h"
 
+#ifdef CONFIG_SPRD_DEBUG
+#include "sdhci-sprd-debugfs.h"
+#include "sdhci-sprd-debugfs.c"
+#include "sdhci-sprd-debug.h"
+#include "sdhci-sprd-debug.c"
+#endif
+
 #define DRIVER_NAME "sdhci"
 
 #define DBG(f, x...) \
@@ -471,6 +478,10 @@ static void sdhci_mod_timer(struct sdhci_host *host, struct mmc_request *mrq,
 		mod_timer(&host->data_timer, timeout);
 	else
 		mod_timer(&host->timer, timeout);
+#ifdef CONFIG_SPRD_DEBUG
+	if (!strcmp(mmc_hostname(host->mmc), "mmc0") && sdhci_data_line_cmd(mrq->cmd))
+		sdhci_sprd_mod_debug_timer(host, jiffies + 256);
+#endif
 }
 
 static void sdhci_del_timer(struct sdhci_host *host, struct mmc_request *mrq)
@@ -479,6 +490,10 @@ static void sdhci_del_timer(struct sdhci_host *host, struct mmc_request *mrq)
 		del_timer(&host->data_timer);
 	else
 		del_timer(&host->timer);
+#ifdef CONFIG_SPRD_DEBUG
+	if (!strcmp(mmc_hostname(host->mmc), "mmc0") && sdhci_data_line_cmd(mrq->cmd))
+		sdhci_sprd_del_debug_timer(host);
+#endif
 }
 
 static inline bool sdhci_has_requests(struct sdhci_host *host)
@@ -1693,6 +1708,14 @@ static bool sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 	if (host->use_external_dma)
 		sdhci_external_dma_pre_transfer(host, cmd);
 
+#ifdef CONFIG_SPRD_DEBUG
+	if (!strcmp(mmc_hostname(host->mmc), "mmc0")) {
+		if (sdhci_sprd_mmc_debug_judge())
+			mmc_debug_update(host, cmd, 0);
+	} else
+		mmc_debug_update(host, cmd, 0);
+#endif
+
 	sdhci_writew(host, SDHCI_MAKE_CMD(cmd->opcode, flags), SDHCI_COMMAND);
 
 	return true;
@@ -2498,26 +2521,29 @@ static int sdhci_get_cd(struct mmc_host *mmc)
 
 static int sdhci_check_ro(struct sdhci_host *host)
 {
-	unsigned long flags;
+	bool allow_invert = false;
 	int is_readonly;
 
-	spin_lock_irqsave(&host->lock, flags);
-
-	if (host->flags & SDHCI_DEVICE_DEAD)
+	if (host->flags & SDHCI_DEVICE_DEAD) {
 		is_readonly = 0;
-	else if (host->ops->get_ro)
+	} else if (host->ops->get_ro) {
 		is_readonly = host->ops->get_ro(host);
-	else if (mmc_can_gpio_ro(host->mmc))
+	} else if (mmc_can_gpio_ro(host->mmc)) {
 		is_readonly = mmc_gpio_get_ro(host->mmc);
-	else
+		/* Do not invert twice */
+		allow_invert = !(host->mmc->caps2 & MMC_CAP2_RO_ACTIVE_HIGH);
+	} else {
 		is_readonly = !(sdhci_readl(host, SDHCI_PRESENT_STATE)
 				& SDHCI_WRITE_PROTECT);
+		allow_invert = true;
+	}
 
-	spin_unlock_irqrestore(&host->lock, flags);
+	if (is_readonly >= 0 &&
+	    allow_invert &&
+	    (host->quirks & SDHCI_QUIRK_INVERTED_WRITE_PROTECT))
+		is_readonly = !is_readonly;
 
-	/* This quirk needs to be replaced by a callback-function later */
-	return host->quirks & SDHCI_QUIRK_INVERTED_WRITE_PROTECT ?
-		!is_readonly : is_readonly;
+	return is_readonly;
 }
 
 #define SAMPLE_COUNT	5
@@ -3576,6 +3602,14 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 
 		if (intmask & SDHCI_INT_DATA_MASK)
 			sdhci_data_irq(host, intmask & SDHCI_INT_DATA_MASK);
+
+#ifdef CONFIG_SPRD_DEBUG
+		if (!strcmp(mmc_hostname(host->mmc), "mmc0")) {
+			if (sdhci_sprd_mmc_debug_judge())
+				mmc_debug_update(host, NULL, intmask);
+		} else
+			mmc_debug_update(host, NULL, intmask);
+#endif
 
 		if (intmask & SDHCI_INT_BUS_POWER)
 			pr_err("%s: Card is consuming too much power!\n",

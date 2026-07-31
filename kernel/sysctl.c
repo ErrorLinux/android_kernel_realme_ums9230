@@ -105,6 +105,9 @@
 #ifdef CONFIG_LOCKUP_DETECTOR
 #include <linux/nmi.h>
 #endif
+#ifdef CONFIG_SPRD_CMA_DEBUG
+#include <linux/cma.h>
+#endif
 
 #if defined(CONFIG_SYSCTL)
 
@@ -137,10 +140,12 @@ static const int cap_last_cap = CAP_LAST_CAP;
  * This is needed for proc_doulongvec_minmax of sysctl_hung_task_timeout_secs
  * and hung_task_check_interval_secs
  */
-#ifdef CONFIG_DETECT_HUNG_TASK
-static unsigned long hung_task_timeout_max = (LONG_MAX/HZ);
-#endif
 
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai start
+//#ifdef CONFIG_DETECT_HUNG_TASK
+static unsigned long hung_task_timeout_max = (LONG_MAX/HZ);
+//#endif
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai end
 #ifdef CONFIG_INOTIFY_USER
 #include <linux/inotify.h>
 #endif
@@ -189,6 +194,7 @@ static int max_extfrag_threshold = 1000;
 #endif
 
 #endif /* CONFIG_SYSCTL */
+extern int extra_free_kbytes;
 
 #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_SYSCTL)
 static int bpf_stats_handler(struct ctl_table *table, int write,
@@ -1821,6 +1827,8 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= sched_rt_handler,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= SYSCTL_INT_MAX,
 	},
 	{
 		.procname	= "sched_rt_runtime_us",
@@ -1828,6 +1836,8 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= sched_rt_handler,
+		.extra1		= SYSCTL_NEG_ONE,
+		.extra2		= SYSCTL_INT_MAX,
 	},
 	{
 		.procname	= "sched_deadline_period_max_us",
@@ -2515,7 +2525,8 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif
-#ifdef CONFIG_DETECT_HUNG_TASK
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai start
+// #ifdef CONFIG_DETECT_HUNG_TASK
 #ifdef CONFIG_SMP
 	{
 		.procname	= "hung_task_all_cpu_backtrace",
@@ -2568,7 +2579,9 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_NEG_ONE,
 	},
-#endif
+//#endif
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai end
+
 #ifdef CONFIG_RT_MUTEXES
 	{
 		.procname	= "max_lock_depth",
@@ -2844,6 +2857,28 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO_HUNDRED,
 	},
+#ifdef CONFIG_DIRECT_SWAPPINESS
+	{
+		.procname       = "direct_swappiness",
+		.data           = &direct_vm_swappiness,
+		.maxlen         = sizeof(direct_vm_swappiness),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec_minmax,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = SYSCTL_TWO_HUNDRED,
+	},
+#endif
+#ifdef CONFIG_SPRD_CMA_DEBUG
+	{
+		.procname	= "sprd_cma_debug",
+		.data		= &sysctl_sprd_cma_debug,
+		.maxlen		= sizeof(int),
+		.mode		= 0200, /* write-only */
+		.proc_handler	= sysctl_sprd_cma_debug_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_TWO,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.procname	= "numa_stat",
@@ -2955,6 +2990,13 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
+	},
+	{	.procname	= "extra_free_kbytes",
+		.data		= &extra_free_kbytes,
+		.maxlen         = sizeof(extra_free_kbytes),
+		.mode           = 0644,
+		.proc_handler   = min_free_kbytes_sysctl_handler,
+		.extra1		= SYSCTL_ZERO
 	},
 	{
 		.procname	= "watermark_scale_factor",
@@ -3176,6 +3218,17 @@ static struct ctl_table vm_table[] = {
 		.procname	= "unprivileged_userfaultfd",
 		.data		= &sysctl_unprivileged_userfaultfd,
 		.maxlen		= sizeof(sysctl_unprivileged_userfaultfd),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+#endif
+#ifdef CONFIG_WRITEBACK_SWAPCACHE
+	{
+		.procname	= "writeback_swapcache",
+		.data		= &writeback_swapcache,
+		.maxlen		= sizeof(writeback_swapcache),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,

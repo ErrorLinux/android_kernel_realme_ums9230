@@ -2652,7 +2652,8 @@ static void __vunmap(const void *addr, int deallocate_pages)
 			__free_pages(page, page_order);
 			cond_resched();
 		}
-		atomic_long_sub(area->nr_pages, &nr_vmalloc_pages);
+		if (!(area->flags & VM_MAP_PUT_PAGES))
+			atomic_long_sub(area->nr_pages, &nr_vmalloc_pages);
 
 		kvfree(area->pages);
 	}
@@ -2837,6 +2838,10 @@ void *vmap_pfn(unsigned long *pfns, unsigned int count, pgprot_t prot)
 		free_vm_area(area);
 		return NULL;
 	}
+
+	flush_cache_vmap((unsigned long)area->addr,
+			 (unsigned long)area->addr + count * PAGE_SIZE);
+
 	return area->addr;
 }
 EXPORT_SYMBOL_GPL(vmap_pfn);
@@ -2897,6 +2902,10 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 			page = alloc_pages_node(nid, gfp, order);
 		if (unlikely(!page))
 			break;
+
+#ifdef CONFIG_SPRD_PAGE_OWNER
+		SetPagePrivate(page);
+#endif
 
 		/*
 		 * Careful, we allocate and map page-order pages, but
@@ -3900,16 +3909,86 @@ void pcpu_free_vm_areas(struct vm_struct **vms, int nr_vms)
 #ifdef CONFIG_PRINTK
 bool vmalloc_dump_obj(void *object)
 {
-	struct vm_struct *vm;
 	void *objp = (void *)PAGE_ALIGN((unsigned long)object);
+	const void *caller;
+	struct vm_struct *vm;
+	struct vmap_area *va;
+	unsigned long addr;
+	unsigned int nr_pages;
 
-	vm = find_vm_area(objp);
-	if (!vm)
+	if (!spin_trylock(&vmap_area_lock))
 		return false;
+	va = __find_vmap_area((unsigned long)objp);
+	if (!va) {
+		spin_unlock(&vmap_area_lock);
+		return false;
+	}
+
+	vm = va->vm;
+	if (!vm) {
+		spin_unlock(&vmap_area_lock);
+		return false;
+	}
+	addr = (unsigned long)vm->addr;
+	caller = vm->caller;
+	nr_pages = vm->nr_pages;
+	spin_unlock(&vmap_area_lock);
 	pr_cont(" %u-page vmalloc region starting at %#lx allocated at %pS\n",
-		vm->nr_pages, (unsigned long)vm->addr, vm->caller);
+		nr_pages, addr, caller);
 	return true;
 }
+#endif
+
+#ifdef CONFIG_E_SHOW_MEM
+void print_vmalloc_info(void)
+{
+	struct vmap_area *va;
+	struct vm_struct *v;
+	unsigned long total_pages = 0;
+
+	pr_info("Detail:\n");
+	spin_lock(&vmap_area_lock);
+
+	if (list_empty(&vmap_area_list))
+		goto out;
+
+
+	list_for_each_entry(va, &vmap_area_list, list) {
+		if (!va || !va->vm)
+			continue;
+		v = va->vm;
+		if (v->nr_pages) {
+			total_pages += v->nr_pages;
+			/* 128K Bytes */
+			if ((v->nr_pages << (PAGE_SHIFT - 10)) < 128)
+				continue;
+
+			pr_info("0x%p-0x%p %7ld %pS %dkB %s%s\n",
+				v->addr, v->addr + v->size, v->size, v->caller,
+				v->nr_pages << (PAGE_SHIFT - 10),
+				(v->flags & VM_ALLOC) ? "vmalloc" : "",
+				(v->flags & VM_MAP) ? "vmap" : "");
+		}
+	}
+	pr_info("Total used:%lukB\n",
+		(unsigned long)(total_pages << (PAGE_SHIFT - 10)));
+
+out:
+	spin_unlock(&vmap_area_lock);
+}
+
+static int vmalloc_e_show_mem_handler(struct notifier_block *nb,
+		unsigned long val, void *data)
+{
+	pr_info("\n");
+	pr_info("Enhanced Mem-info :VMALLOC\n");
+	print_vmalloc_info();
+	return 0;
+}
+
+static struct notifier_block vmalloc_e_show_mem_notifier = {
+	.notifier_call = vmalloc_e_show_mem_handler,
+};
 #endif
 
 #ifdef CONFIG_PROC_FS
@@ -4051,6 +4130,9 @@ static int __init proc_vmalloc_init(void)
 				nr_node_ids * sizeof(unsigned int), NULL);
 	else
 		proc_create_seq("vmallocinfo", 0400, NULL, &vmalloc_op);
+#ifdef CONFIG_E_SHOW_MEM
+	register_e_show_mem_notifier(&vmalloc_e_show_mem_notifier);
+#endif
 	return 0;
 }
 module_init(proc_vmalloc_init);

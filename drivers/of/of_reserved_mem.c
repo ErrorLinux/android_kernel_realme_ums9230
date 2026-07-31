@@ -22,12 +22,66 @@
 #include <linux/slab.h>
 #include <linux/memblock.h>
 #include <linux/kmemleak.h>
+#include <linux/cma.h>
+
+#ifdef CONFIG_SPRD_SHOW_RESERVED_MEM
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
+#include <linux/module.h>
+#endif
 
 #include "of_private.h"
 
 #define MAX_RESERVED_REGIONS	128
 static struct reserved_mem reserved_mem[MAX_RESERVED_REGIONS];
 static int reserved_mem_count;
+
+#ifdef CONFIG_E_SHOW_MEM
+void show_reserved_memory_info(void)
+{
+	int i;
+
+	for (i = 0; i < reserved_mem_count; i++)
+		pr_info("name: %s, base: %#016llx, size: %#016llx\n",
+				reserved_mem[i].name,
+				(unsigned long long)reserved_mem[i].base,
+				(unsigned long long)reserved_mem[i].size);
+}
+#endif
+
+#ifdef CONFIG_SPRD_SHOW_RESERVED_MEM
+static int meminfo_show(struct seq_file *m, void *p)
+{
+	int i;
+
+	for (i = 0; i < reserved_mem_count; i++)
+		seq_printf(m, "name: %s, base: %#016llx, size: %#016llx\n",
+				reserved_mem[i].name,
+				(unsigned long long)reserved_mem[i].base,
+				(unsigned long long)reserved_mem[i].size);
+	return 0;
+}
+
+static int meminfo_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, meminfo_show, NULL);
+}
+
+static const struct proc_ops proc_show_mem_operations = {
+	.proc_open              = meminfo_open,
+	.proc_read              = seq_read,
+	.proc_lseek             = seq_lseek,
+	.proc_release           = single_release,
+};
+
+static int __init reserved_proc_init(void)
+{
+	proc_create("show_reserved_mem", 0200, NULL, &proc_show_mem_operations);
+	return 0;
+}
+
+module_init(reserved_proc_init);
+#endif
 
 static int __init early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
 	phys_addr_t align, phys_addr_t start, phys_addr_t end, bool nomap,
@@ -117,12 +171,8 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
 	if (IS_ENABLED(CONFIG_CMA)
 	    && of_flat_dt_is_compatible(node, "shared-dma-pool")
 	    && of_get_flat_dt_prop(node, "reusable", NULL)
-	    && !nomap) {
-		unsigned long order =
-			max_t(unsigned long, MAX_ORDER - 1, pageblock_order);
-
-		align = max(align, (phys_addr_t)PAGE_SIZE << order);
-	}
+	    && !nomap)
+		align = max_t(phys_addr_t, align, CMA_MIN_ALIGNMENT_BYTES);
 
 	prop = of_get_flat_dt_prop(node, "alloc-ranges", &len);
 	if (prop) {

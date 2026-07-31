@@ -68,6 +68,7 @@
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(mm_vmscan_direct_reclaim_begin);
 EXPORT_TRACEPOINT_SYMBOL_GPL(mm_vmscan_direct_reclaim_end);
+EXPORT_TRACEPOINT_SYMBOL_GPL(mm_vmscan_kswapd_wake);
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/vmscan.h>
@@ -171,6 +172,14 @@ struct scan_control {
 
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
+	/*
+	 * Reclaim pages from a vma. If the page is shared by other tasks
+	 * it is zapped from a vma without reclaim so it ends up remaining
+	 * on memory until last task zap it.
+	 */
+	#ifdef CONFIG_PROCESS_RECLAIM
+	struct vm_area_struct *target_vma;
+	#endif
 };
 
 #ifdef ARCH_HAS_PREFETCHW
@@ -191,6 +200,21 @@ struct scan_control {
  * From 0 .. 200.  Higher means more swappy.
  */
 int vm_swappiness = 60;
+
+#ifdef CONFIG_DIRECT_SWAPPINESS
+/*
+ * Direct reclaim swappiness, exptct 0 - 60. Higher means more
+ * swappy and slower.
+ */
+int direct_vm_swappiness = 60;
+#endif
+
+#ifdef CONFIG_WRITEBACK_SWAPCACHE
+  /*
+   * writeback swapcache, expect 0 or 1
+   */
+int writeback_swapcache;
+#endif
 
 static void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs)
@@ -594,7 +618,14 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
 	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
 		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
 			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
-
+	/*
+	 * If there are no reclaimable file-backed or anonymous pages,
+	 * ensure zones with sufficient free pages are not skipped.
+	 * This prevents zones like DMA32 from being ignored in reclaim
+	 * scenarios where they can still help alleviate memory pressure.
+	 */
+	if (nr == 0)
+		nr = zone_page_state_snapshot(zone, NR_FREE_PAGES);
 	return nr;
 }
 
@@ -1420,7 +1451,12 @@ static unsigned int shrink_page_list(struct list_head *page_list,
 
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
+#ifdef CONFIG_PROCESS_RECLAIM
+	if (pgdat)
+		do_demote_pass = can_demote(pgdat->node_id, sc);
+#else
 	do_demote_pass = can_demote(pgdat->node_id, sc);
+#endif
 
 retry:
 	while (!list_empty(page_list)) {
@@ -1439,7 +1475,10 @@ retry:
 			goto keep;
 
 		VM_BUG_ON_PAGE(PageActive(page), page);
-
+	#ifdef CONFIG_PROCESS_RECLAIM
+		if (pgdat)
+			VM_BUG_ON_PAGE(page_pgdat(page) != pgdat, page);
+	#endif
 		nr_pages = compound_nr(page);
 
 		/* Account the number of base pages even though THP */
@@ -1661,6 +1700,14 @@ retry:
 				flags |= TTU_SPLIT_HUGE_PMD;
 			if (!ignore_references)
 				trace_android_vh_page_trylock_set(page);
+		#ifdef CONFIG_PROCESS_RECLAIM
+			if (!try_to_unmap(page, flags, sc->target_vma)) {
+				stat->nr_unmap_fail += nr_pages;
+				if (!was_swapbacked && PageSwapBacked(page))
+					stat->nr_lazyfree_fail += nr_pages;
+				goto activate_locked;
+			}
+		#else
 			try_to_unmap(page, flags);
 			if (page_mapped(page)) {
 				stat->nr_unmap_fail += nr_pages;
@@ -1668,6 +1715,7 @@ retry:
 					stat->nr_lazyfree_fail += nr_pages;
 				goto activate_locked;
 			}
+		#endif
 		}
 
 		if (PageDirty(page)) {
@@ -1681,9 +1729,16 @@ retry:
 			 * the rest of the LRU for clean pages and see
 			 * the same dirty pages again (PageReclaim).
 			 */
+		#ifdef CONFIG_PROCESS_RECLAIM
+			if (page_is_file_lru(page) &&
+			    (!current_is_kswapd() || !PageReclaim(page) ||
+			     (pgdat &&
+			     !test_bit(PGDAT_DIRTY, &pgdat->flags)))) {
+		#else
 			if (page_is_file_lru(page) &&
 			    (!current_is_kswapd() || !PageReclaim(page) ||
 			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
+		#endif
 				/*
 				 * Immediately reclaim when written back.
 				 * Similar in principal to deactivate_page()
@@ -1815,6 +1870,15 @@ free_it:
 			destroy_compound_page(page);
 		else
 			list_add(&page->lru, &free_pages);
+		/*
+		 * If pagelist are from multiple zones, we should decrease
+		 * NR_ISOLATED_ANON + x on freed pages in here.
+		 */
+		#ifdef CONFIG_PROCESS_RECLAIM
+		if (!pgdat)
+			dec_node_page_state(page, NR_ISOLATED_ANON +
+					page_is_file_lru(page));
+		#endif
 		continue;
 
 activate_locked_split:
@@ -1862,7 +1926,12 @@ keep:
 	/* 'page_list' is always empty here */
 
 	/* Migrate pages selected for demotion */
+#ifdef CONFIG_PROCESS_RECLAIM
+	if (pgdat)
+		nr_reclaimed += demote_page_list(&demote_pages, pgdat);
+#else
 	nr_reclaimed += demote_page_list(&demote_pages, pgdat);
+#endif
 	/* Pages that could not be demoted are still in @demote_pages */
 	if (!list_empty(&demote_pages)) {
 		/* Pages which failed to demoted go back on @page_list for retry: */
@@ -1889,6 +1958,10 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
 		.may_unmap = 1,
+#ifdef CONFIG_PROCESS_RECLAIM
+		/* Doesn't allow to write out dirty page */
+		.may_writepage = 0,
+#endif
 	};
 	struct reclaim_stat stat;
 	unsigned int nr_reclaimed;
@@ -1931,6 +2004,41 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 			    -(long)stat.nr_lazyfree_fail);
 	return nr_reclaimed;
 }
+
+#ifdef CONFIG_PROCESS_RECLAIM
+unsigned long reclaim_pages_from_list(struct list_head *page_list,
+					struct vm_area_struct *vma)
+{
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL,
+		.priority = DEF_PRIORITY,
+		.may_writepage = 1,
+		.may_unmap = 1,
+		.may_swap = 1,
+		.target_vma = vma,
+	};
+
+	unsigned long nr_reclaimed;
+	struct page *page;
+	struct reclaim_stat dummy_stat;
+
+	list_for_each_entry(page, page_list, lru)
+		ClearPageActive(page);
+
+	nr_reclaimed = shrink_page_list(page_list, NULL, &sc,
+			 &dummy_stat, true);
+
+	while (!list_empty(page_list)) {
+		page = lru_to_page(page_list);
+		list_del(&page->lru);
+		dec_node_page_state(page, NR_ISOLATED_ANON +
+				page_is_file_lru(page));
+		putback_lru_page(page);
+	}
+
+	return nr_reclaimed;
+}
+#endif
 
 /*
  * Update LRU sizes after isolating pages. The LRU size updates must
@@ -2733,6 +2841,11 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	unsigned long ap, fp;
 	enum lru_list lru;
 	bool balance_anon_file_reclaim = false;
+
+	#ifdef CONFIG_DIRECT_SWAPPINESS
+	if (!current_is_kswapd())
+		swappiness = direct_vm_swappiness;
+	#endif
 
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
@@ -4194,6 +4307,8 @@ restart:
 	smp_store_release(&lrugen->max_seq, lrugen->max_seq + 1);
 
 	spin_unlock_irq(&lruvec->lru_lock);
+
+	trace_android_vh_mglru_new_gen(NULL);
 }
 
 static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
@@ -5824,7 +5939,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 /* Use reclaim/compaction for costly allocs or under memory pressure */
 static bool in_reclaim_compaction(struct scan_control *sc)
 {
-	if (IS_ENABLED(CONFIG_COMPACTION) && sc->order &&
+	if (gfp_compaction_allowed(sc->gfp_mask) && sc->order &&
 			(sc->order > PAGE_ALLOC_COSTLY_ORDER ||
 			 sc->priority < DEF_PRIORITY - 2))
 		return true;
@@ -6068,6 +6183,9 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
 {
 	unsigned long watermark;
 	enum compact_result suitable;
+
+	if (!gfp_compaction_allowed(sc->gfp_mask))
+		return false;
 
 	suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
 	if (suitable == COMPACT_SUCCESS)
@@ -6790,6 +6908,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	struct zone *zone;
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
+#ifdef CONFIG_WRITEBACK_SWAPCACHE
+		.may_writepage = !!writeback_swapcache,
+#endif
 		.order = order,
 		.may_unmap = 1,
 	};
@@ -7169,6 +7290,8 @@ kswapd_try_sleep:
 						alloc_order);
 		reclaim_order = balance_pgdat(pgdat, alloc_order,
 						highest_zoneidx);
+		trace_android_vh_vmscan_kswapd_done(pgdat->node_id, highest_zoneidx,
+						alloc_order, reclaim_order);
 		if (reclaim_order < alloc_order)
 			goto kswapd_try_sleep;
 	}

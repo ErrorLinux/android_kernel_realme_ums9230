@@ -135,6 +135,10 @@ static ssize_t sysfs_kf_write(struct kernfs_open_file *of, char *buf,
 
 	if (!count)
 		return 0;
+#if defined(CONFIG_SPRD_DEBUG)
+	if (strstr(buf, "Modem Assert"))
+		pr_info("FS_DEBUG: in %s\n", __func__);
+#endif
 
 	return ops->store(kobj, of->kn->priv, buf, count);
 }
@@ -440,6 +444,8 @@ struct kernfs_node *sysfs_break_active_protection(struct kobject *kobj,
 	kn = kernfs_find_and_get(kobj->sd, attr->name);
 	if (kn)
 		kernfs_break_active_protection(kn);
+	else
+		kobject_put(kobj);
 	return kn;
 }
 EXPORT_SYMBOL_GPL(sysfs_break_active_protection);

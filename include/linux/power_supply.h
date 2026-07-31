@@ -174,6 +174,10 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_MANUFACTURE_YEAR,
 	POWER_SUPPLY_PROP_MANUFACTURE_MONTH,
 	POWER_SUPPLY_PROP_MANUFACTURE_DAY,
+#ifndef OPLUS_FEATURE_CHG_BASIC
+	POWER_SUPPLY_PROP_CHARGE_ENABLED,
+	POWER_SUPPLY_PROP_FEED_WATCHDOG,
+#endif
 	/* Properties of type `const char *' */
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_MANUFACTURER,
@@ -355,6 +359,29 @@ struct power_supply_resistance_temp_table {
 
 #define POWER_SUPPLY_OCV_TEMP_MAX 20
 
+#ifndef OPLUS_FEATURE_CHG_BASIC
+struct power_supply_charge_current {
+	int sdp_limit;
+	int sdp_cur;
+	int dcp_limit;
+	int dcp_cur;
+	int cdp_limit;
+	int cdp_cur;
+	int aca_limit;
+	int aca_cur;
+	int unknown_limit;
+	int unknown_cur;
+	int fchg_limit;
+	int fchg_cur;
+	int flash_limit;
+	int flash_cur;
+	int wl_bpp_cur;
+	int wl_bpp_limit;
+	int wl_epp_cur;
+	int wl_epp_limit;
+};
+#endif
+
 /*
  * This is the recommended struct to manage static battery parameters,
  * populated by power_supply_get_battery_info(). Most platform drivers should
@@ -390,6 +417,9 @@ struct power_supply_battery_info {
 	int ocv_table_size[POWER_SUPPLY_OCV_TEMP_MAX];
 	struct power_supply_resistance_temp_table *resist_table;
 	int resist_table_size;
+#ifndef OPLUS_FEATURE_CHG_BASIC
+	struct power_supply_charge_current cur;
+#endif
 
 	ANDROID_KABI_RESERVE(1);
 };

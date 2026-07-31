@@ -267,13 +267,14 @@ static void sysrq_handle_showallcpus(int key)
 		if (in_hardirq())
 			regs = get_irq_regs();
 
-		pr_info("CPU%d:\n", smp_processor_id());
+		pr_info("CPU%d:\n", get_cpu());
 		if (regs)
 			show_regs(regs);
 		else
 			show_stack(NULL, NULL, KERN_INFO);
 
 		schedule_work(&sysrq_showallcpus);
+		put_cpu();
 	}
 }
 
@@ -428,7 +429,9 @@ static const struct sysrq_key_op sysrq_thaw_op = {
 static void sysrq_handle_kill(int key)
 {
 	send_sig_all(SIGKILL);
+#if !IS_ENABLED(CONFIG_SPRD_DEBUG)
 	console_loglevel = CONSOLE_LOGLEVEL_DEBUG;
+#endif
 }
 static const struct sysrq_key_op sysrq_kill_op = {
 	.handler	= sysrq_handle_kill,

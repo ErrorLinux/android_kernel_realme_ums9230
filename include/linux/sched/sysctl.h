@@ -6,7 +6,8 @@
 
 struct ctl_table;
 
-#ifdef CONFIG_DETECT_HUNG_TASK
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai start
+//#ifdef CONFIG_DETECT_HUNG_TASK
 
 #ifdef CONFIG_SMP
 extern unsigned int sysctl_hung_task_all_cpu_backtrace;
@@ -21,10 +22,11 @@ extern unsigned long sysctl_hung_task_check_interval_secs;
 extern int sysctl_hung_task_warnings;
 int proc_dohung_task_timeout_secs(struct ctl_table *table, int write,
 		void *buffer, size_t *lenp, loff_t *ppos);
-#else
+//#else
 /* Avoid need for ifdefs elsewhere in the code */
-enum { sysctl_hung_task_timeout_secs = 0 };
-#endif
+//enum { sysctl_hung_task_timeout_secs = 0 };
+//#endif
+//odm alm_id:5321993 struk to reboot function ; build-in  for gki 2023/3/17 wangshuaishuai end
 
 extern unsigned int sysctl_sched_child_runs_first;
 

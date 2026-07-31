@@ -80,6 +80,7 @@
 
 #include "musb_core.h"
 #include "musb_trace.h"
+#include "sprd_musbhsdma.h"
 
 #define TA_WAIT_BCON(m) max_t(int, (m)->a_wait_bcon, OTG_TIME_A_WAIT_BCON)
 
@@ -99,6 +100,25 @@ MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:" MUSB_DRIVER_NAME);
 
+static void musb_dma_forceon(void __iomem *mregs)
+{
+	__raw_writel(0x0, mregs + MUSB_DMA_PAUSE);
+}
+
+static void musb_dma_forceoff(void __iomem *mregs)
+{
+	int cnt = 262144;
+	u32 pause;
+
+	/* usb workaround for lost 4 tx bytes.  cnt can't exceed 2^18 */
+	__raw_writel(0x1, mregs + MUSB_DMA_PAUSE);
+	do {
+		pause = __raw_readl(mregs + MUSB_DMA_PAUSE);
+		if (pause & 0x10000)
+			break;
+		 cpu_relax();
+	} while (cnt-- > 0);
+}
 
 /*-------------------------------------------------------------------------*/
 
@@ -318,6 +338,8 @@ static void musb_default_write_fifo(struct musb_hw_ep *hw_ep, u16 len,
 
 	if (unlikely(len == 0))
 		return;
+	if (musb->fixup_ep0fifo)
+		musb_dma_forceoff(musb->mregs);
 
 	prefetch((u8 *)src);
 
@@ -350,6 +372,9 @@ static void musb_default_write_fifo(struct musb_hw_ep *hw_ep, u16 len,
 		/* byte aligned */
 		iowrite8_rep(fifo, src, len);
 	}
+
+	if (musb->fixup_ep0fifo)
+		musb_dma_forceon(musb->mregs);
 }
 
 /*
@@ -362,6 +387,8 @@ static void musb_default_read_fifo(struct musb_hw_ep *hw_ep, u16 len, u8 *dst)
 
 	if (unlikely(len == 0))
 		return;
+	if (musb->fixup_ep0fifo)
+		musb_dma_forceoff(musb->mregs);
 
 	dev_dbg(musb->controller, "%cX ep%d fifo %p count %d buf %p\n",
 			'R', hw_ep->epnum, fifo, len, dst);
@@ -392,6 +419,9 @@ static void musb_default_read_fifo(struct musb_hw_ep *hw_ep, u16 len, u8 *dst)
 		/* byte aligned */
 		ioread8_rep(fifo, dst, len);
 	}
+
+	if (musb->fixup_ep0fifo)
+		musb_dma_forceon(musb->mregs);
 }
 
 /*
@@ -1204,6 +1234,13 @@ void musb_start(struct musb *musb)
 	if (musb->config->maximum_speed == USB_SPEED_HIGH ||
 			musb->config->maximum_speed == USB_SPEED_UNKNOWN)
 		power |= MUSB_POWER_HSENAB;
+
+	/*
+	 * for suspend/resume feature, we should set POWER.Enable_SuspendM to enable
+	 * SUSPENDM output, which can control phy to enter into suspend mode.
+	 */
+	power |= MUSB_POWER_ENSUSPEND;
+
 	musb_writeb(regs, MUSB_POWER, power);
 
 	musb->is_active = 0;
@@ -1540,6 +1577,12 @@ done:
 	return 0;
 }
 
+int musb_reset_all_fifo_2_default(struct musb *musb)
+{
+	pr_debug("%s: set %s FIFO setting\n", musb_driver_name, is_host_active(musb) ? "Host" : "Device");
+	return ep_config_from_table(musb);
+}
+EXPORT_SYMBOL_GPL(musb_reset_all_fifo_2_default);
 
 /*
  * ep_config_from_hw - when MUSB_C_DYNFIFO_DEF is false
@@ -1976,104 +2019,6 @@ static struct attribute *musb_attrs[] = {
 };
 ATTRIBUTE_GROUPS(musb);
 
-#define MUSB_QUIRK_B_INVALID_VBUS_91	(MUSB_DEVCTL_BDEVICE | \
-					 (2 << MUSB_DEVCTL_VBUS_SHIFT) | \
-					 MUSB_DEVCTL_SESSION)
-#define MUSB_QUIRK_B_DISCONNECT_99	(MUSB_DEVCTL_BDEVICE | \
-					 (3 << MUSB_DEVCTL_VBUS_SHIFT) | \
-					 MUSB_DEVCTL_SESSION)
-#define MUSB_QUIRK_A_DISCONNECT_19	((3 << MUSB_DEVCTL_VBUS_SHIFT) | \
-					 MUSB_DEVCTL_SESSION)
-
-static bool musb_state_needs_recheck(struct musb *musb, u8 devctl,
-				     const char *desc)
-{
-	if (musb->quirk_retries && !musb->flush_irq_work) {
-		trace_musb_state(musb, devctl, desc);
-		schedule_delayed_work(&musb->irq_work,
-				      msecs_to_jiffies(1000));
-		musb->quirk_retries--;
-
-		return true;
-	}
-
-	return false;
-}
-
-/*
- * Check the musb devctl session bit to determine if we want to
- * allow PM runtime for the device. In general, we want to keep things
- * active when the session bit is set except after host disconnect.
- *
- * Only called from musb_irq_work. If this ever needs to get called
- * elsewhere, proper locking must be implemented for musb->session.
- */
-static void musb_pm_runtime_check_session(struct musb *musb)
-{
-	u8 devctl, s;
-	int error;
-
-	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
-
-	/* Handle session status quirks first */
-	s = MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV |
-		MUSB_DEVCTL_HR;
-	switch (devctl & ~s) {
-	case MUSB_QUIRK_B_DISCONNECT_99:
-		musb_state_needs_recheck(musb, devctl,
-			"Poll devctl in case of suspend after disconnect");
-		break;
-	case MUSB_QUIRK_B_INVALID_VBUS_91:
-		if (musb_state_needs_recheck(musb, devctl,
-				"Poll devctl on invalid vbus, assume no session"))
-			return;
-		fallthrough;
-	case MUSB_QUIRK_A_DISCONNECT_19:
-		if (musb_state_needs_recheck(musb, devctl,
-				"Poll devctl on possible host mode disconnect"))
-			return;
-		if (!musb->session)
-			break;
-		trace_musb_state(musb, devctl, "Allow PM on possible host mode disconnect");
-		pm_runtime_mark_last_busy(musb->controller);
-		pm_runtime_put_autosuspend(musb->controller);
-		musb->session = false;
-		return;
-	default:
-		break;
-	}
-
-	/* No need to do anything if session has not changed */
-	s = devctl & MUSB_DEVCTL_SESSION;
-	if (s == musb->session)
-		return;
-
-	/* Block PM or allow PM? */
-	if (s) {
-		trace_musb_state(musb, devctl, "Block PM on active session");
-		error = pm_runtime_get_sync(musb->controller);
-		if (error < 0)
-			dev_err(musb->controller, "Could not enable: %i\n",
-				error);
-		musb->quirk_retries = 3;
-
-		/*
-		 * We can get a spurious MUSB_INTR_SESSREQ interrupt on start-up
-		 * in B-peripheral mode with nothing connected and the session
-		 * bit clears silently. Check status again in 3 seconds.
-		 */
-		if (devctl & MUSB_DEVCTL_BDEVICE)
-			schedule_delayed_work(&musb->irq_work,
-					      msecs_to_jiffies(3000));
-	} else {
-		trace_musb_state(musb, devctl, "Allow PM with no session");
-		pm_runtime_mark_last_busy(musb->controller);
-		pm_runtime_put_autosuspend(musb->controller);
-	}
-
-	musb->session = s;
-}
-
 /* Only used to provide driver mode change events */
 static void musb_irq_work(struct work_struct *data)
 {
@@ -2086,8 +2031,6 @@ static void musb_irq_work(struct work_struct *data)
 
 		return;
 	}
-
-	musb_pm_runtime_check_session(musb);
 
 	if (musb->xceiv->otg->state != musb->xceiv_old_state) {
 		musb->xceiv_old_state = musb->xceiv->otg->state;
@@ -2260,10 +2203,17 @@ int musb_queue_resume_work(struct musb *musb,
 	if (WARN_ON(!callback))
 		return -EINVAL;
 
+	pm_runtime_get_sync(musb->controller);
+
 	spin_lock_irqsave(&musb->list_lock, flags);
 	is_suspended = musb->is_runtime_suspended;
+	/* Fix me, temp solution for adb offline issue */
+	if (is_suspended)
+		dev_info(musb->controller, "is_suspended true.\n");
+	is_suspended = false;
 
 	if (is_suspended) {
+		WARN(1, "is suspended why?\n");
 		w = devm_kzalloc(musb->controller, sizeof(*w), GFP_ATOMIC);
 		if (!w) {
 			error = -ENOMEM;
@@ -2283,6 +2233,8 @@ out_unlock:
 	if (!is_suspended)
 		error = callback(musb, data);
 
+	pm_runtime_mark_last_busy(musb->controller);
+	pm_runtime_put_autosuspend(musb->controller);
 	return error;
 }
 EXPORT_SYMBOL_GPL(musb_queue_resume_work);
@@ -2548,12 +2500,18 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 		status = musb_platform_set_mode(musb, MUSB_PERIPHERAL);
 		break;
 	case MUSB_OTG:
-		status = musb_host_setup(musb, plat->power);
-		if (status < 0)
-			goto fail3;
+		/*
+		 * start host when ID is ground, do not init here
+		 * //status = musb_host_setup(musb, plat->power);
+		 * //if (status < 0)
+		 * //goto fail3;
+		 */
 		status = musb_gadget_setup(musb);
 		if (status) {
-			musb_host_cleanup(musb);
+			/*
+			 * do not need cleanup also
+			 * //musb_host_cleanup(musb);
+			 */
 			goto fail3;
 		}
 		status = musb_platform_set_mode(musb, MUSB_OTG);
@@ -2738,6 +2696,7 @@ static void musb_save_context(struct musb *musb)
 		musb->context.index_regs[i].rxhubport =
 			musb_read_rxhubport(musb, i);
 	}
+	musb->restore_complete = false;
 }
 
 static void musb_restore_context(struct musb *musb)
@@ -2747,6 +2706,9 @@ static void musb_restore_context(struct musb *musb)
 	void __iomem *epio;
 	u8 power;
 
+	if (musb->restore_complete)
+		return;
+	musb->restore_complete = true;
 	musb_writew(musb_base, MUSB_FRAME, musb->context.frame);
 	musb_writeb(musb_base, MUSB_TESTMODE, musb->context.testmode);
 	musb_writeb(musb_base, MUSB_ULPI_BUSCONTROL, musb->context.busctl);
@@ -2828,11 +2790,19 @@ static int musb_suspend(struct device *dev)
 	unsigned long	flags;
 	int ret;
 
+	/* in host mode, don't do suspend */
+	if (is_host_active(musb)) {
+		dev_info(musb->controller, "don't do %s in host mode\n", __func__);
+		return 0;
+	}
+
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0) {
 		pm_runtime_put_noidle(dev);
 		return ret;
 	}
+
+	dev_info(musb->controller, "musb suspend\n");
 
 	musb_platform_disable(musb);
 	musb_disable_interrupts(musb);
@@ -2872,6 +2842,14 @@ static int musb_resume(struct device *dev)
 	int error;
 	u8 devctl;
 	u8 mask;
+
+	/* in host mode, don't do resume */
+	if (is_host_active(musb)) {
+		dev_info(musb->controller, "don't do %s in host mode\n", __func__);
+		return 0;
+	}
+
+	dev_info(musb->controller, "musb resume\n");
 
 	/*
 	 * For static cmos like DaVinci, register values were preserved
@@ -2917,6 +2895,8 @@ static int musb_runtime_suspend(struct device *dev)
 {
 	struct musb	*musb = dev_to_musb(dev);
 
+	dev_info(musb->controller, "musb runtime suspend\n");
+
 	musb_save_context(musb);
 	musb->is_runtime_suspended = 1;
 
@@ -2940,6 +2920,8 @@ static int musb_runtime_resume(struct device *dev)
 	 */
 	if (!musb->is_initialized)
 		return 0;
+
+	dev_info(musb->controller, "musb runtime resume\n");
 
 	musb_restore_context(musb);
 

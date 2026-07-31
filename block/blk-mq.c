@@ -40,6 +40,7 @@
 #include "blk-stat.h"
 #include "blk-mq-sched.h"
 #include "blk-rq-qos.h"
+#include "blk-ioprio.h"
 
 #include <trace/hooks/block.h>
 
@@ -320,6 +321,10 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	else
 		rq->start_time_ns = 0;
 	rq->io_start_time_ns = 0;
+#ifdef CONFIG_SPRD_DEBUG
+	rq->softirq_raise_time_ns = 0;
+	rq->softirq_entry_time_ns = 0;
+#endif
 	rq->stats_sectors = 0;
 	rq->nr_phys_segments = 0;
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
@@ -585,9 +590,15 @@ static void blk_complete_reqs(struct llist_head *list)
 {
 	struct llist_node *entry = llist_reverse_order(llist_del_all(list));
 	struct request *rq, *next;
-
+#ifdef CONFIG_SPRD_DEBUG
+	llist_for_each_entry_safe(rq, next, entry, ipi_list) {
+		rq->softirq_entry_time_ns = ktime_get_ns();
+		rq->q->mq_ops->complete(rq);
+	}
+#else
 	llist_for_each_entry_safe(rq, next, entry, ipi_list)
 		rq->q->mq_ops->complete(rq);
+#endif
 }
 
 static __latent_entropy void blk_done_softirq(struct softirq_action *h)
@@ -639,6 +650,9 @@ static void blk_mq_complete_send_ipi(struct request *rq)
 
 	cpu = rq->mq_ctx->cpu;
 	list = &per_cpu(blk_cpu_done, cpu);
+#ifdef CONFIG_SPRD_DEBUG
+	rq->softirq_raise_time_ns = ktime_get_ns();
+#endif
 	if (llist_add(&rq->ipi_list, list)) {
 		INIT_CSD(&rq->csd, __blk_mq_complete_request_remote, rq);
 		smp_call_function_single_async(cpu, &rq->csd);
@@ -651,6 +665,9 @@ static void blk_mq_raise_softirq(struct request *rq)
 
 	preempt_disable();
 	list = this_cpu_ptr(&blk_cpu_done);
+#ifdef CONFIG_SPRD_DEBUG
+	rq->softirq_raise_time_ns = ktime_get_ns();
+#endif
 	if (llist_add(&rq->ipi_list, list))
 		raise_softirq(BLOCK_SOFTIRQ);
 	preempt_enable();
@@ -911,8 +928,18 @@ static bool blk_mq_req_expired(struct request *rq, unsigned long *next)
 		return false;
 
 	deadline = READ_ONCE(rq->deadline);
+#ifdef CONFIG_SPRD_DEBUG
+	if (unlikely(deadline == 0))
+		return false;
+	if (time_after_eq(jiffies, deadline)) {
+		pr_err("%s: jiffies: %lu, ns: %lu, deadline: %lu, rq: %0x", __func__,
+			jiffies, ktime_get_ns(), deadline, (unsigned long)rq);
+		return true;
+	}
+#else
 	if (time_after_eq(jiffies, deadline))
 		return true;
+#endif
 
 	if (*next == 0)
 		*next = deadline;
@@ -1178,6 +1205,22 @@ static bool blk_mq_mark_tag_wait(struct blk_mq_hw_ctx *hctx,
 	atomic_inc(&sbq->ws_active);
 	wait->flags &= ~WQ_FLAG_EXCLUSIVE;
 	__add_wait_queue(wq, wait);
+
+	/*
+	 * Add one explicit barrier since blk_mq_get_driver_tag() may
+	 * not imply barrier in case of failure.
+	 *
+	 * Order adding us to wait queue and allocating driver tag.
+	 *
+	 * The pair is the one implied in sbitmap_queue_wake_up() which
+	 * orders clearing sbitmap tag bits and waitqueue_active() in
+	 * __sbitmap_queue_wake_up(), since waitqueue_active() is lockless
+	 *
+	 * Otherwise, re-order of adding wait queue and getting driver tag
+	 * may cause __sbitmap_queue_wake_up() to wake up nothing because
+	 * the waitqueue_active() may not observe us in wait queue.
+	 */
+	smp_mb();
 
 	/*
 	 * It's possible that a tag was freed in the window between the
@@ -1709,6 +1752,14 @@ void blk_mq_delay_run_hw_queues(struct request_queue *q, unsigned long msecs)
 		if (blk_mq_hctx_stopped(hctx))
 			continue;
 		/*
+		 * If there is already a run_work pending, leave the
+		 * pending delay untouched. Otherwise, a hctx can stall
+		 * if another hctx is re-delaying the other's work
+		 * before the work executes.
+		 */
+		if (delayed_work_pending(&hctx->run_work))
+			continue;
+		/*
 		 * Dispatch from this hctx either if there's no hctx preferred
 		 * by IO scheduler or if it has requests that bypass the
 		 * scheduler.
@@ -1800,6 +1851,12 @@ void blk_mq_start_stopped_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 		return;
 
 	clear_bit(BLK_MQ_S_STOPPED, &hctx->state);
+	/*
+	 * Pairs with the smp_mb() in blk_mq_hctx_stopped() to order the
+	 * clearing of BLK_MQ_S_STOPPED above and the checking of dispatch
+	 * list in the subsequent routine.
+	 */
+	smp_mb__after_atomic();
 	blk_mq_run_hw_queue(hctx, async);
 }
 EXPORT_SYMBOL_GPL(blk_mq_start_stopped_hw_queue);
@@ -2164,6 +2221,14 @@ static inline unsigned short blk_plug_max_rq_count(struct blk_plug *plug)
 	return BLK_MAX_REQUEST_COUNT;
 }
 
+static void bio_set_ioprio(struct bio *bio)
+{
+	/* Nobody set ioprio so far? Initialize it based on task's nice value */
+	if (IOPRIO_PRIO_CLASS(bio->bi_ioprio) == IOPRIO_CLASS_NONE)
+		bio->bi_ioprio = get_current_ioprio();
+	blkcg_set_ioprio(bio);
+}
+
 /**
  * blk_mq_submit_bio - Create and send a request to block device.
  * @bio: Bio pointer.
@@ -2202,6 +2267,8 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
 
 	if (!bio_integrity_prep(bio))
 		goto queue_exit;
+
+	bio_set_ioprio(bio);
 
 	if (!is_flush_fua && !blk_queue_nomerges(q) &&
 	    blk_attempt_plug_merge(q, bio, nr_segs, &same_queue_rq))

@@ -28,6 +28,7 @@ asflags-y  :=
 ccflags-y  :=
 cppflags-y :=
 ldflags-y  :=
+KBUILD_LDS_MODULE_ATTACH :=
 
 subdir-asflags-y :=
 subdir-ccflags-y :=
@@ -50,6 +51,10 @@ include $(srctree)/scripts/Makefile.lib
 hostprogs := $(sort $(hostprogs))
 ifneq ($(hostprogs),)
 include $(srctree)/scripts/Makefile.host
+endif
+
+ifneq ($(dtb-y),)
+include scripts/Makefile.dtbo
 endif
 
 # Do not include userprogs rules unless needed.
@@ -311,8 +316,11 @@ endif
 cmd_mod = printf '%s\n' $(call real-search, $*.o, .o, -objs -y -m) | \
 	$(AWK) '!x[$$0]++ { print("$(obj)/"$$0) }' > $@
 
+cmd_mod_lds = $(if $(KBUILD_LDS_MODULE_ATTACH), cat $(srctree)/$(src)/$(firstword $(KBUILD_LDS_MODULE_ATTACH)) > $(@:.mod=.lds))
+
 $(obj)/%.mod: FORCE
 	$(call if_changed,mod)
+	$(call cmd,mod_lds)
 
 # List module undefined symbols
 cmd_undefined_syms = $(NM) $< | sed -n 's/^  *U //p' > $@

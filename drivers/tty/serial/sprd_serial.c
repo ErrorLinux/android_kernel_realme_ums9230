@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
+#include <linux/pinctrl/consumer.h>
 
 /* device name */
 #define UART_NR_MAX		8
@@ -126,6 +127,7 @@ struct sprd_uart_port {
 	struct sprd_uart_dma rx_dma;
 	dma_addr_t pos;
 	unsigned char *rx_buf_tail;
+	struct pinctrl *pctrl;
 };
 
 static struct sprd_uart_port *sprd_port[UART_NR_MAX];
@@ -367,7 +369,7 @@ static void sprd_rx_free_buf(struct sprd_uart_port *sp)
 	if (sp->rx_dma.virt)
 		dma_free_coherent(sp->port.dev, SPRD_UART_RX_SIZE,
 				  sp->rx_dma.virt, sp->rx_dma.phys_addr);
-
+	sp->rx_dma.virt = NULL;
 }
 
 static int sprd_rx_dma_config(struct uart_port *port, u32 burst)
@@ -716,6 +718,7 @@ static int sprd_startup(struct uart_port *port)
 	unsigned int timeout;
 	struct sprd_uart_port *sp;
 	unsigned long flags;
+	struct pinctrl_state *state;
 
 	serial_out(port, SPRD_CTL2,
 		   THLD_TX_EMPTY << THLD_TX_EMPTY_SHIFT | THLD_RX_FULL);
@@ -751,6 +754,22 @@ static int sprd_startup(struct uart_port *port)
 	fc |= RX_TOUT_THLD_DEF | RX_HFC_THLD_DEF;
 	serial_out(port, SPRD_CTL1, fc);
 
+	/*change pin matrix when use ap_uart0, conect inf1 to ap_uart0*/
+	if (port->line == 0) {
+		state = pinctrl_lookup_state(sp->pctrl, "ap_uart0_1");
+		if (IS_ERR(state)) {
+			dev_err(port->dev, "fail to get pin state\n");
+			return PTR_ERR(state);
+		}
+
+		ret = pinctrl_select_state(sp->pctrl, state);
+		if (ret != 0) {
+			dev_err(port->dev, "fail to select pin state\n");
+			return ret;
+		}
+	}
+
+
 	/* enable interrupt */
 	spin_lock_irqsave(&port->lock, flags);
 	ien = serial_in(port, SPRD_IEN);
@@ -765,10 +784,29 @@ static int sprd_startup(struct uart_port *port)
 
 static void sprd_shutdown(struct uart_port *port)
 {
+	int ret;
+	struct pinctrl_state *state;
+	struct sprd_uart_port *sp;
+
+	sp = container_of(port, struct sprd_uart_port, port);
 	sprd_release_dma(port);
 	serial_out(port, SPRD_IEN, 0);
 	serial_out(port, SPRD_ICLR, ~0);
 	devm_free_irq(port->dev, port->irq, port);
+
+
+	if (port->line == 0) {
+		state = pinctrl_lookup_state(sp->pctrl, "ap_uart1_1");
+		if (IS_ERR(state)) {
+			dev_err(port->dev, "fail to get pin state\n");
+		}
+
+		ret = pinctrl_select_state(sp->pctrl, state);
+		if (ret != 0) {
+			dev_err(port->dev, "fail to select pin state\n");
+		}
+	}
+
 }
 
 static void sprd_set_termios(struct uart_port *port,
@@ -911,9 +949,11 @@ static void sprd_pm(struct uart_port *port, unsigned int state,
 	switch (state) {
 	case UART_PM_STATE_ON:
 		clk_prepare_enable(sup->clk);
+		pr_emerg("yanbin: uart %d eb\n", port->line);
 		break;
 	case UART_PM_STATE_OFF:
 		clk_disable_unprepare(sup->clk);
+		pr_emerg("yanbin: uart %d disable\n", port->line);
 		break;
 	}
 }
@@ -1133,7 +1173,7 @@ static bool sprd_uart_is_console(struct uart_port *uport)
 static int sprd_clk_init(struct uart_port *uport)
 {
 	struct clk *clk_uart, *clk_parent;
-	struct sprd_uart_port *u = sprd_port[uport->line];
+	struct sprd_uart_port *u = container_of(uport, struct sprd_uart_port, port);
 
 	clk_uart = devm_clk_get(uport->dev, "uart");
 	if (IS_ERR(clk_uart)) {
@@ -1176,22 +1216,23 @@ static int sprd_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	struct uart_port *up;
+	struct sprd_uart_port *sport;
 	int irq;
 	int index;
 	int ret;
+	struct pinctrl *p;
 
 	index = of_alias_get_id(pdev->dev.of_node, "serial");
-	if (index < 0 || index >= ARRAY_SIZE(sprd_port)) {
+	if (index < 0 || index >= UART_NR_MAX) {
 		dev_err(&pdev->dev, "got a wrong serial alias id %d\n", index);
 		return -EINVAL;
 	}
 
-	sprd_port[index] = devm_kzalloc(&pdev->dev, sizeof(*sprd_port[index]),
-					GFP_KERNEL);
-	if (!sprd_port[index])
+	sport = devm_kzalloc(&pdev->dev, sizeof(*sport), GFP_KERNEL);
+	if (!sport)
 		return -ENOMEM;
 
-	up = &sprd_port[index]->port;
+	up = &sport->port;
 	up->dev = &pdev->dev;
 	up->line = index;
 	up->type = PORT_SPRD;
@@ -1222,7 +1263,7 @@ static int sprd_probe(struct platform_device *pdev)
 	 * Allocate one dma buffer to prepare for receive transfer, in case
 	 * memory allocation failure at runtime.
 	 */
-	ret = sprd_rx_alloc_buf(sprd_port[index]);
+	ret = sprd_rx_alloc_buf(sport);
 	if (ret)
 		return ret;
 
@@ -1230,17 +1271,37 @@ static int sprd_probe(struct platform_device *pdev)
 		ret = uart_register_driver(&sprd_uart_driver);
 		if (ret < 0) {
 			pr_err("Failed to register SPRD-UART driver\n");
-			return ret;
+			goto free_rx_buf;
 		}
 	}
+
 	sprd_ports_num++;
+	sprd_port[index] = sport;
+
+	/*get pinctrl to change matrix when use uart0*/
+	if (index == 0) {
+		p = devm_pinctrl_get(&pdev->dev);
+		if (IS_ERR(p)) {
+			dev_err(&pdev->dev, "get pinctrl failed!\n");
+			return PTR_ERR(p);
+		}
+		sprd_port[index]->pctrl = p;
+	}
 
 	ret = uart_add_one_port(&sprd_uart_driver, up);
 	if (ret)
-		sprd_remove(pdev);
+		goto clean_port;
 
 	platform_set_drvdata(pdev, up);
 
+	return 0;
+
+clean_port:
+	sprd_port[index] = NULL;
+	if (--sprd_ports_num == 0)
+		uart_unregister_driver(&sprd_uart_driver);
+free_rx_buf:
+	sprd_rx_free_buf(sport);
 	return ret;
 }
 
@@ -1250,6 +1311,7 @@ static int sprd_suspend(struct device *dev)
 	struct sprd_uart_port *sup = dev_get_drvdata(dev);
 
 	uart_suspend_port(&sprd_uart_driver, &sup->port);
+	pr_emerg("yanbin: uart %d suspend\n", sup->port.line);
 
 	return 0;
 }
@@ -1259,6 +1321,7 @@ static int sprd_resume(struct device *dev)
 	struct sprd_uart_port *sup = dev_get_drvdata(dev);
 
 	uart_resume_port(&sprd_uart_driver, &sup->port);
+	pr_emerg("yanbin: uart %d resume\n", sup->port.line);
 
 	return 0;
 }

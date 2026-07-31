@@ -15,6 +15,7 @@ obj-$(CONFIG_IIO_TRIGGERED_EVENT) += industrialio-triggered-event.o
 
 obj-y += accel/
 obj-y += adc/
+obj-y += addac/
 obj-y += afe/
 obj-y += amplifiers/
 obj-y += buffer/
@@ -41,3 +42,4 @@ obj-y += resolver/
 obj-y += temperature/
 obj-y += test/
 obj-y += trigger/
+obj-$(CONFIG_SPRD_SENSOR_HUB) += sprd_hub/

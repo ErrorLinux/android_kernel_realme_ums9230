@@ -2077,6 +2077,14 @@ extern void usb_led_activity(enum usb_led_event ev);
 static inline void usb_led_activity(enum usb_led_event ev) {}
 #endif
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+#if IS_ENABLED(CONFIG_USB_SC27XX_TYPEC)
+extern void usb_audio_on_set_cc_level_default(void);
+#else
+static inline void usb_audio_on_set_cc_level_default(void) {}
+#endif
+#endif
+
 #endif  /* __KERNEL__ */
 
 #endif
