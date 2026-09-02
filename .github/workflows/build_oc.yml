@@ -1,4 +1,4 @@
-```yaml
+
 name: Build OC Kernel for Redmi A5 (serenity)
 
 on:
@@ -103,4 +103,3 @@ jobs:
             kernel_src/out/boot.img
             kernel_src/out/drivers/cpufreq/sprd-cpufreq-v2.ko
           retention-days: 7
-```
