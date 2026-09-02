@@ -1,0 +1,106 @@
+```yaml
+name: Build OC Kernel for Redmi A5 (serenity)
+
+on:
+  workflow_dispatch:
+    inputs:
+      oc_freq:
+        description: 'Big core max frequency (MHz)'
+        required: true
+        default: '2220'
+      oc_volt:
+        description: 'Voltage (mV) for OC freq'
+        required: true
+        default: '1150'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: realme-kernel/ums9230_kernel
+          ref: realme-ums9230_v_15.0
+          path: kernel_src
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git make gcc-aarch64-linux-gnu libssl-dev bc bison flex libelf-dev cpio python3 device-tree-compiler
+
+      - name: Apply OC patch
+        working-directory: kernel_src
+        run: |
+          cat > oc.patch << 'EOF'
+          --- a/drivers/cpufreq/sprd-cpufreq-v2-driver.c
+          +++ b/drivers/cpufreq/sprd-cpufreq-v2-driver.c
+          @@ -262,6 +262,22 @@ static int sprd_policy_table_update(struct cpufreq_policy *policy, struct temp_n
+                   }
+          +
+          +    if (cluster->id == 1) {
+          +        freq = ${{ github.event.inputs.oc_freq }}000000ULL;
+          +        vol = ${{ github.event.inputs.oc_volt }}000;
+          +        pr_info("Adding custom OC OPP: %lluHz/%lluuV for big cluster\n", freq, vol);
+          +
+          +        if (policy->freq_table)
+          +            dev_pm_opp_remove(cpu, freq);
+          +
+          +        ret = dev_pm_opp_add(cpu, freq, vol);
+          +        if (ret) {
+          +            pr_err("add custom OC OPP %lluHz/%lluuV error(%d)\n", freq, vol, ret);
+          +        } else {
+          +            cluster->table_entry_num++;
+          +        }
+          +    }
+          +
+           if (node->temp_table)
+               policy->freq_table = node->temp_table;
+           else {
+          EOF
+          patch -p1 < oc.patch
+
+      - name: Apply thermal disable patch
+        working-directory: kernel_src
+        run: |
+          make O=out ARCH=arm64 sprd_gki_sharkl6_defconfig
+          for opt in THERMAL CPU_THERMAL THERMAL_GOV_STEP_WISE THERMAL_GOV_FAIR_SHARE THERMAL_GOV_USER_SPACE THERMAL_GOV_POWER_ALLOCATOR SPRD_THERMAL SPRD_QOGIRL6_THERMAL SPRD_UMS512_THERMAL SPRD_VIRTUAL_THERMAL; do
+            ./scripts/config --file out/.config --disable CONFIG_$opt 2>/dev/null || true
+          done
+
+      - name: Build kernel
+        working-directory: kernel_src
+        run: |
+          make O=out ARCH=arm64 -j$(nproc) Image.gz dtbs dtbo.img modules
+
+      - name: Build boot.img
+        working-directory: kernel_src
+        run: |
+          find out/arch/arm64/boot/dts/sprd -name "*.dtb" | sort | xargs cat > out/dtb.img
+          python3 -m pip install mkbootimg --break-system-packages
+          mkbootimg \
+            --kernel out/arch/arm64/boot/Image.gz \
+            --ramdisk /dev/zero \
+            --dtb out/dtb.img \
+            --header_version 4 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x01000000 \
+            --tags_offset 0x00000100 \
+            --pagesize 4096 \
+            --base 0x00000000 \
+            --cmdline "console=ttyS1,115200n8 bootconfig" \
+            -o out/boot.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-kernel-${{ github.event.inputs.oc_freq }}MHz
+          path: |
+            kernel_src/out/arch/arm64/boot/Image.gz
+            kernel_src/out/dtb.img
+            kernel_src/out/arch/arm64/boot/dtbo.img
+            kernel_src/out/boot.img
+            kernel_src/out/drivers/cpufreq/sprd-cpufreq-v2.ko
+          retention-days: 7
+```
