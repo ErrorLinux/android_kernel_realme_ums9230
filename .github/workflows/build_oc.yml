@@ -135,35 +135,123 @@ jobs:
           grep -n "Adding custom OC OPP" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: OC marker missing"
           grep -n "Thermal throttling disabled" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: thermal marker missing"
 
-      - name: Build kernel image + dtbs + cpufreq module
+      - name: Build kernel image + cpufreq module
         run: |
           set -e
           export PATH="/opt/clang/bin:${PATH}"
           export LLVM=1 ARCH=arm64
           make O=out ARCH=arm64 LLVM=1 ums9230_gki_defconfig
-          make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz dtbs dtbo.img
+          make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) M=drivers/cpufreq
           echo "=== build artifacts ==="
           ls -la out/arch/arm64/boot/Image.gz
-          find out -name "*.dtb" | head
           find out -name "sprd-cpufreq-v2.ko" | head
 
-      - name: Pack boot image
+      - name: Pack boot image (optional, uses STOCK dtb.img if present)
         run: |
           set -e
-          find out/arch/arm64/boot/dts/sprd -name "*.dtb" | sort | xargs cat > out/dtb.img
-          mkbootimg \
-            --kernel out/arch/arm64/boot/Image.gz \
-            --dtb out/dtb.img \
-            --header_version 4 \
-            --kernel_offset 0x00008000 \
-            --ramdisk_offset 0x01000000 \
-            --tags_offset 0x00000100 \
-            --pagesize 4096 \
-            --base 0x00000000 \
-            --cmdline "console=ttyS1,115200n8 bootconfig" \
-            -o out/boot.img
-          ls -la out/boot.img
+          # OC chỉ thay đổi kernel image + module; device tree (dtb/dtbo) KHÔNG đổi.
+          # Kernel nguồn này là cây Realme (generic) KHÔNG có tuỳ chỉnh "serenity"
+          # của Redmi A5, nên KHÔNG build lại dtbo/dtb ở đây để tránh sai cây DT.
+          # OC được áp dụng thực tế bằng cách nạp module sprd-cpufreq-v2.ko (stock boot/dtbo giữ nguyên).
+          if [ -f prebuilts/dtb.img ]; then
+            mkbootimg \
+              --kernel out/arch/arm64/boot/Image.gz \
+              --dtb prebuilts/dtb.img \
+              --header_version 4 \
+              --kernel_offset 0x00008000 \
+              --ramdisk_offset 0x01000000 \
+              --tags_offset 0x00000100 \
+              --pagesize 4096 \
+              --base 0x00000000 \
+              --cmdline "console=ttyS1,115200n8 bootconfig" \
+              -o out/boot.img
+            ls -la out/boot.img
+          else
+            echo "SKIP: chưa có prebuilts/dtb.img (dtb stock serenity) trong repo. Chỉ upload Image.gz + module."
+          fi
+
+      - name: Package Magisk module (flashable zip)
+        env:
+          OC_FREQ_MHZ: ${{ github.event.inputs.oc_freq }}
+        run: |
+          set -e
+          # Tạo Magisk module boot-safe: chỉ nạp ko patched lúc boot, KHÔNG đụng
+          # kernel/boot/dtbo → gỡ module (hoặc insmod fail) = trả về stock, không bootloop.
+          MDIR=magisk_module
+          rm -rf "$MDIR"
+          mkdir -p "$MDIR"
+          cp out/drivers/cpufreq/sprd-cpufreq-v2.ko "$MDIR/"
+
+          cat > "$MDIR/module.prop" << EOF
+id=oc-cpufreq-ums9230
+name=OC CPUFreq UMS9230 (Redmi A5)
+version=${OC_FREQ_MHZ}MHz
+versionCode=${OC_FREQ_MHZ}
+author=local
+description=Load patched sprd-cpufreq-v2.ko cho ${OC_FREQ_MHZ}MHz OC + tắt thermal Redmi A5. An toàn: không đổi kernel/boot/dtbo. Giữ Vol-Down lúc boot hoặc tạo \$MODDIR/disable để bỏ qua.
+EOF
+
+          cat > "$MDIR/service.sh" << 'SHEOF'
+#!/system/bin/sh
+MODDIR=${0%/*}
+LOG=/data/local/tmp/oc_cpufreq.log
+trap 'echo "[oc] error, boot continues" >> $LOG; exit 0' ERR
+echo "[oc] $(date '+%F %T') start" >> $LOG
+# 1) Tắt tay: tạo $MODDIR/disable
+if [ -f "$MODDIR/disable" ]; then
+  echo "[oc] disabled by marker file" >> $LOG
+  exit 0
+fi
+# 2) An toàn: giữ Vol-Down lúc boot để boot stock
+if command -v getevent >/dev/null 2>&1; then
+  if getevent -lc 3 2>/dev/null | grep -q "KEY_VOLUMEDOWN"; then
+    echo "[oc] Volume-Down held -> OC skipped (stock boot)" >> $LOG
+    exit 0
+  fi
+fi
+# 3) Nếu ko đã load thì thôi
+if grep -qs "^sprd_cpufreq_v2 " /proc/modules; then
+  echo "[oc] sprd_cpufreq_v2 already loaded" >> $LOG
+  exit 0
+fi
+# 4) Gỡ bản stock (nếu có) — fail thì bỏ qua
+rmmod sprd_cpufreq_v2 2>>$LOG || true
+# 5) Nạp ko patched; fail thì cố khôi phục stock rồi tiếp tục boot
+if insmod "$MODDIR/sprd-cpufreq-v2.ko" 2>>$LOG; then
+  echo "[oc] insmod patched ko OK" >> $LOG
+else
+  echo "[oc] insmod FAILED -> OC inactive, device boots normally" >> $LOG
+  for STOCK in \
+    /vendor_dlkm/lib/modules/sprd-cpufreq-v2.ko \
+    /system_dlkm/lib/modules/sprd-cpufreq-v2.ko \
+    /vendor/lib/modules/sprd-cpufreq-v2.ko; do
+    if [ -f "$STOCK" ]; then
+      insmod "$STOCK" 2>>$LOG || true
+      break
+    fi
+  done
+fi
+exit 0
+SHEOF
+          chmod +x "$MDIR/service.sh"
+
+          python3 - "$MDIR" << 'PYEOF'
+import sys, os, zipfile, stat
+mdir = sys.argv[1]
+out = "/tmp/oc-cpufreq-{}MHz-magisk.zip".format(os.environ.get("OC_FREQ_MHZ", "2220"))
+files = ["module.prop", "service.sh", "sprd-cpufreq-v2.ko"]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for f in files:
+        zi = zipfile.ZipInfo(f)
+        if f == "service.sh":
+            zi.external_attr = 0o100755 << 16
+        with open(os.path.join(mdir, f), "rb") as fh:
+            z.writestr(zi, fh.read())
+print("wrote " + out)
+PYEOF
+          cp /tmp/oc-cpufreq-${OC_FREQ_MHZ}MHz-magisk.zip out/
+          ls -la out/*.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -171,8 +259,7 @@ jobs:
           name: oc-kernel-${{ github.event.inputs.oc_freq }}MHz
           path: |
             out/arch/arm64/boot/Image.gz
-            out/dtb.img
-            out/arch/arm64/boot/dtbo.img
             out/boot.img
             out/drivers/cpufreq/sprd-cpufreq-v2.ko
+            out/*.zip
           retention-days: 7
