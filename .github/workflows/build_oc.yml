@@ -147,6 +147,13 @@ jobs:
           export LLVM=1 ARCH=arm64
           # Generate .config from the merged defconfig
           make O=out ARCH=arm64 LLVM=1 ums9230_gki_defconfig
+          # The vendor fragment enables OPLUS charger configs, but this Realme
+          # kernel tree has NO drivers/power/oplus/ directory. Disable those
+          # symbols so the build doesn't fail (OC only touches drivers/cpufreq).
+          sed -i \
+            -e 's/^CONFIG_OPLUS_CHARGER=y/# CONFIG_OPLUS_CHARGER is not set/' \
+            -e 's/^CONFIG_OPLUS_CHG=m/# CONFIG_OPLUS_CHG is not set/' \
+            out/.config
           # Build the kernel image
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz
           # Build the sprd cpufreq module from the patched source
