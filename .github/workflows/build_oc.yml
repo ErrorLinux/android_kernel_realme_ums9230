@@ -1,4 +1,4 @@
-
+yaml
 name: Build OC Kernel for Redmi A5 (serenity)
 
 on:
@@ -16,72 +16,130 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          repository: realme-kernel/ums9230_kernel
-          ref: realme-ums9230_v_15.0
           path: kernel_src
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt update
-          sudo apt install -y git make gcc-aarch64-linux-gnu libssl-dev bc bison flex libelf-dev cpio python3 device-tree-compiler
+          sudo apt install -y git make bc bison flex libssl-dev libelf-dev cpio \
+            python3 device-tree-compiler lz4 lzop libncurses-dev curl unzip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          pip3 install --break-system-packages mkbootimg
 
-      - name: Apply OC patch
-        working-directory: kernel_src
+      - name: Download AOSP LLVM (clang-15) toolchain
         run: |
-          cat > oc.patch << 'EOF'
-          --- a/drivers/cpufreq/sprd-cpufreq-v2-driver.c
-          +++ b/drivers/cpufreq/sprd-cpufreq-v2-driver.c
-          @@ -262,6 +262,22 @@ static int sprd_policy_table_update(struct cpufreq_policy *policy, struct temp_n
-                   }
-          +
-          +    if (cluster->id == 1) {
-          +        freq = ${{ github.event.inputs.oc_freq }}000000ULL;
-          +        vol = ${{ github.event.inputs.oc_volt }}000;
-          +        pr_info("Adding custom OC OPP: %lluHz/%lluuV for big cluster\n", freq, vol);
-          +
-          +        if (policy->freq_table)
-          +            dev_pm_opp_remove(cpu, freq);
-          +
-          +        ret = dev_pm_opp_add(cpu, freq, vol);
-          +        if (ret) {
-          +            pr_err("add custom OC OPP %lluHz/%lluuV error(%d)\n", freq, vol, ret);
-          +        } else {
-          +            cluster->table_entry_num++;
-          +        }
-          +    }
-          +
-           if (node->temp_table)
-               policy->freq_table = node->temp_table;
-           else {
-          EOF
-          patch -p1 < oc.patch
-
-      - name: Apply thermal disable patch
-        working-directory: kernel_src
-        run: |
-          make O=out ARCH=arm64 sprd_gki_sharkl6_defconfig
-          for opt in THERMAL CPU_THERMAL THERMAL_GOV_STEP_WISE THERMAL_GOV_FAIR_SHARE THERMAL_GOV_USER_SPACE THERMAL_GOV_POWER_ALLOCATOR SPRD_THERMAL SPRD_QOGIRL6_THERMAL SPRD_UMS512_THERMAL SPRD_VIRTUAL_THERMAL; do
-            ./scripts/config --file out/.config --disable CONFIG_$opt 2>/dev/null || true
+          set -e
+          mkdir -p /opt/clang
+          # clang-15 (r450784e) là toolchain đúng cho kernel android13-5.15 này
+          for REF in android13-release main master; do
+            if curl -fL --retry 3 --max-time 1800 -o /tmp/clang.tar.gz \
+                "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${REF}/clang-r450784e.tar.gz" 2>/dev/null; then
+              echo "fetched clang from branch ${REF}"
+              break
+            fi
           done
+          test -s /tmp/clang.tar.gz || { echo "clang download failed"; exit 1; }
+          tar -xzf /tmp/clang.tar.gz -C /opt/clang
+          test -x /opt/clang/bin/clang || { echo "clang not found in bundle"; exit 1; }
 
-      - name: Build kernel
+      - name: Merge defconfig + fragment into ums9230_gki_defconfig
         working-directory: kernel_src
         run: |
-          make O=out ARCH=arm64 -j$(nproc) Image.gz dtbs dtbo.img modules
+          set -e
+          # Đúng quy trình của vendor: merge gki_defconfig + sprd_gki_sharkl6.fragment
+          KCONFIG_CONFIG=arch/arm64/configs/ums9230_gki_defconfig \
+            ./scripts/kconfig/merge_config.sh -m -r \
+              arch/arm64/configs/gki_defconfig \
+              arch/arm64/configs/sprd_gki_sharkl6.fragment \
+              > /tmp/merge.log 2>&1 || { echo "merge failed"; tail -50 /tmp/merge.log; exit 1; }
+          echo "merge_config done"
 
-      - name: Build boot.img
+      - name: Apply OC + thermal-disable patch
         working-directory: kernel_src
         run: |
+          set -e
+          python3 << 'PY'
+          freq_mhz = ${{ github.event.inputs.oc_freq }}
+          volt_mv   = ${{ github.event.inputs.oc_volt }}
+          p = "drivers/cpufreq/sprd-cpufreq-v2-driver.c"
+          s = open(p).read()
+
+          # 1) Overclock: thêm OPP 2220MHz vào big cluster (id==1)
+          if "Adding custom OC OPP" not in s:
+              anchor = "\tif (node->temp_table)\n\t\tpolicy->freq_table = node->temp_table;"
+              assert anchor in s, "anchor 1 (temp_table) not found"
+              oc = """\t/* OC: force max freq/volt on the big cluster (Cortex-A75) */
+\tif (cluster->id == 1) {
+\t\tfreq = %d000000ULL;
+\t\tvol = %d000;
+\t\tpr_info("Adding custom OC OPP: %%lluHz/%%lluuV for big cluster\\n", freq, vol);
+\t\tif (policy->freq_table)
+\t\t\tdev_pm_opp_remove(cpu, freq);
+\t\tret = dev_pm_opp_add(cpu, freq, vol);
+\t\tif (ret)
+\t\t\tpr_err("add custom OC OPP %%lluHz/%%lluuV error(%%d)\\n", freq, vol, ret);
+\t\telse
+\t\t\tcluster->table_entry_num++;
+\t}
+
+""" % (freq_mhz, volt_mv)
+              s = s.replace(anchor, oc + anchor, 1)
+          else:
+              print("OC block already present, skipping")
+
+          # 2) Tắt thermal throttling: vô hiệu hóa worker cập nhật theo nhiệt độ
+          start = s.index("static void sprd_cpufreq_temp_work_func(struct work_struct *work)")
+          end = s.index("/* sprd_cpufreq_driver interface */")
+          neutral = """static void sprd_cpufreq_temp_work_func(struct work_struct *work)
+{
+\tstruct delayed_work *dwork = to_delayed_work(work);
+\tstruct cluster_info *cluster =
+\t\tcontainer_of(dwork, struct cluster_info, temp_work);
+
+\t/* Thermal throttling disabled: do not downgrade DVFS by temperature. */
+\tif (cluster)
+\t\tpr_debug("cluster %u thermal throttling disabled\\n", cluster->id);
+}
+
+"""
+          s = s[:start] + neutral + s[end:]
+
+          open(p, "w").write(s)
+          print("OC + thermal patch applied")
+          PY
+
+      - name: Verify patch applied
+        working-directory: kernel_src
+        run: |
+          grep -n "Adding custom OC OPP" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: OC marker missing"
+          grep -n "Thermal throttling disabled" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: thermal marker missing"
+
+      - name: Build kernel image + dtbs + cpufreq module
+        working-directory: kernel_src
+        run: |
+          set -e
+          export PATH="/opt/clang/bin:${PATH}"
+          export LLVM=1 ARCH=arm64
+          make O=out ARCH=arm64 LLVM=1 ums9230_gki_defconfig
+          make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz dtbs dtbo.img
+          make O=out ARCH=arm64 LLVM=1 -j$(nproc) M=drivers/cpufreq
+          echo "=== build artifacts ==="
+          ls -la out/arch/arm64/boot/Image.gz
+          find out -name "*.dtb" | head
+          find out -name "sprd-cpufreq-v2.ko" | head
+
+      - name: Pack boot image
+        working-directory: kernel_src
+        run: |
+          set -e
           find out/arch/arm64/boot/dts/sprd -name "*.dtb" | sort | xargs cat > out/dtb.img
-          python3 -m pip install mkbootimg --break-system-packages
-          mkbootimg \
+          python3 -m mkbootimg \
             --kernel out/arch/arm64/boot/Image.gz \
-            --ramdisk /dev/zero \
             --dtb out/dtb.img \
             --header_version 4 \
             --kernel_offset 0x00008000 \
@@ -91,6 +149,7 @@ jobs:
             --base 0x00000000 \
             --cmdline "console=ttyS1,115200n8 bootconfig" \
             -o out/boot.img
+          ls -la out/boot.img
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
