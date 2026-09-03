@@ -96,7 +96,7 @@ jobs:
                   "\tif (cluster->id == 1) {\n"
                   "\t\tfreq = %dULL;\n" % (freq_mhz * 1000000)
                   + "\t\tvol = %d;\n" % (volt_mv * 1000)
-                  + "\t\tpr_info(\"%s: %lluHz/%lluuV for big cluster\\n\", freq, vol);\n" % marker
+                  + "\t\tpr_info(\"%s: %%lluHz/%%lluuV for big cluster\\n\", freq, vol);\n" % marker
                   + "\t\tif (policy->freq_table)\n"
                   + "\t\t\tdev_pm_opp_remove(cpu, freq);\n"
                   + "\t\tret = dev_pm_opp_add(cpu, freq, vol);\n"
