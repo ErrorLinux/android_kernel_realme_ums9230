@@ -26,8 +26,10 @@ jobs:
           sudo apt install -y git make bc bison flex libssl-dev libelf-dev cpio \
             python3 device-tree-compiler lz4 lzop libncurses-dev curl unzip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          # mkbootimg không còn trên PyPI nữa → build công cụ C từ fork osm0sis
+          # mkbootimg không còn trên PyPI nữa → build công cụ C từ fork osm0sis.
+          # GCC mới báo lỗi -Werror=stringop-overflow trong libmincrypt → bỏ -Werror trước khi build.
           git clone --depth 1 https://github.com/osm0sis/mkbootimg.git
+          sed -i 's/ -Werror//' mkbootimg/Makefile mkbootimg/libmincrypt/Makefile
           make -C mkbootimg
           sudo cp mkbootimg/mkbootimg /usr/local/bin/
           sudo cp mkbootimg/unpackbootimg /usr/local/bin/
