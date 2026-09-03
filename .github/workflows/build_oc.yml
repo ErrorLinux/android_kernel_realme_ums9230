@@ -20,8 +20,6 @@ jobs:
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
-        with:
-          path: kernel_src
 
       - name: Install build dependencies
         run: |
@@ -48,7 +46,7 @@ jobs:
           test -x /opt/clang/bin/clang || { echo "clang not found in bundle"; exit 1; }
 
       - name: Merge defconfig + fragment into ums9230_gki_defconfig
-        working-directory: kernel_src
+        working-directory: android_kernel_realme_ums9230-realme-ums9230_v_15.0
         run: |
           set -e
           # Đúng quy trình của vendor: merge gki_defconfig + sprd_gki_sharkl6.fragment
@@ -60,7 +58,7 @@ jobs:
           echo "merge_config done"
 
       - name: Apply OC + thermal-disable patch
-        working-directory: kernel_src
+        working-directory: android_kernel_realme_ums9230-realme-ums9230_v_15.0
         run: |
           set -e
           python3 << 'PY'
@@ -114,13 +112,13 @@ jobs:
           PY
 
       - name: Verify patch applied
-        working-directory: kernel_src
+        working-directory: android_kernel_realme_ums9230-realme-ums9230_v_15.0
         run: |
           grep -n "Adding custom OC OPP" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: OC marker missing"
           grep -n "Thermal throttling disabled" drivers/cpufreq/sprd-cpufreq-v2-driver.c || echo "WARN: thermal marker missing"
 
       - name: Build kernel image + dtbs + cpufreq module
-        working-directory: kernel_src
+        working-directory: android_kernel_realme_ums9230-realme-ums9230_v_15.0
         run: |
           set -e
           export PATH="/opt/clang/bin:${PATH}"
@@ -134,7 +132,7 @@ jobs:
           find out -name "sprd-cpufreq-v2.ko" | head
 
       - name: Pack boot image
-        working-directory: kernel_src
+        working-directory: android_kernel_realme_ums9230-realme-ums9230_v_15.0
         run: |
           set -e
           find out/arch/arm64/boot/dts/sprd -name "*.dtb" | sort | xargs cat > out/dtb.img
@@ -156,9 +154,9 @@ jobs:
         with:
           name: oc-kernel-${{ github.event.inputs.oc_freq }}MHz
           path: |
-            kernel_src/out/arch/arm64/boot/Image.gz
-            kernel_src/out/dtb.img
-            kernel_src/out/arch/arm64/boot/dtbo.img
-            kernel_src/out/boot.img
-            kernel_src/out/drivers/cpufreq/sprd-cpufreq-v2.ko
+            android_kernel_realme_ums9230-realme-ums9230_v_15.0/out/arch/arm64/boot/Image.gz
+            android_kernel_realme_ums9230-realme-ums9230_v_15.0/out/dtb.img
+            android_kernel_realme_ums9230-realme-ums9230_v_15.0/out/arch/arm64/boot/dtbo.img
+            android_kernel_realme_ums9230-realme-ums9230_v_15.0/out/boot.img
+            android_kernel_realme_ums9230-realme-ums9230_v_15.0/out/drivers/cpufreq/sprd-cpufreq-v2.ko
           retention-days: 7
