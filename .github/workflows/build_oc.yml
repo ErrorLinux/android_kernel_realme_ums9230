@@ -26,7 +26,11 @@ jobs:
           sudo apt install -y git make bc bison flex libssl-dev libelf-dev cpio \
             python3 device-tree-compiler lz4 lzop libncurses-dev curl unzip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          pip3 install --break-system-packages mkbootimg
+          # mkbootimg không còn trên PyPI nữa → build công cụ C từ fork osm0sis
+          git clone --depth 1 https://github.com/osm0sis/mkbootimg.git
+          make -C mkbootimg
+          sudo cp mkbootimg/mkbootimg /usr/local/bin/
+          sudo cp mkbootimg/unpackbootimg /usr/local/bin/
 
       - name: Download AOSP LLVM (clang-15) toolchain
         run: |
@@ -133,7 +137,7 @@ jobs:
         run: |
           set -e
           find out/arch/arm64/boot/dts/sprd -name "*.dtb" | sort | xargs cat > out/dtb.img
-          python3 -m mkbootimg \
+          mkbootimg \
             --kernel out/arch/arm64/boot/Image.gz \
             --dtb out/dtb.img \
             --header_version 4 \
