@@ -26,8 +26,9 @@ jobs:
           sudo apt install -y git make bc bison flex libssl-dev libelf-dev cpio \
             python3 device-tree-compiler lz4 lzop libncurses-dev curl unzip \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          # mkbootimg không còn trên PyPI nữa → build công cụ C từ fork osm0sis.
-          # GCC mới báo lỗi -Werror=stringop-overflow trong libmincrypt → bỏ -Werror trước khi build.
+          # mkbootimg is no longer on PyPI, so build the C tool from the osm0sis fork.
+          # Newer GCC trips a -Werror=stringop-overflow in the bundled libmincrypt,
+          # so strip -Werror before building.
           git clone --depth 1 https://github.com/osm0sis/mkbootimg.git
           sed -i 's/ -Werror//' mkbootimg/Makefile mkbootimg/libmincrypt/Makefile
           make -C mkbootimg
@@ -38,10 +39,11 @@ jobs:
         run: |
           set -e
           mkdir -p /opt/clang
-          # Kernel build.config.constants ghim CLANG_VERSION=r450784e, nhưng
-          # android.googlesource.com không còn phục vụ đúng build đó trên branch heads.
-          # Nhánh android13 vẫn phát hành clang-15 với hậu tố chữ tăng dần (r450784d, ...),
-          # đều là toolchain tương đương. Thử nhiều branch/version cho tới khi tải được.
+          # The kernel build.config.constants pins CLANG_VERSION=r450784e, but
+          # android.googlesource.com no longer serves that exact build on the
+          # branch heads. The android13 line still ships clang-15 builds under
+          # ever-increasing letter suffixes (r450784d, etc.), all equivalent
+          # toolchains. Try several branches/versions until one downloads.
           FOUND=0
           for REF in android13-release llvm-r450784 android13-qpr1-release android13-qpr2-release; do
             for VER in r450784e r450784d r450784c r450784b; do
@@ -58,7 +60,7 @@ jobs:
           done
           [ "$FOUND" = "1" ] || { echo "clang download failed"; exit 1; }
           tar -xzf /tmp/clang.tar.gz -C /opt/clang
-          # Cập nhật CLANG_VERSION cho khớp với build đã tải.
+          # Update the kernel's pinned CLANG_VERSION so metadata is consistent.
           sed -i 's/^CLANG_VERSION=.*/CLANG_VERSION=r450784d/' build.config.constants
           ls /opt/clang/bin
           test -x /opt/clang/bin/clang || { echo "clang not found in bundle"; exit 1; }
@@ -66,13 +68,16 @@ jobs:
       - name: Merge defconfig + fragment into ums9230_gki_defconfig
         run: |
           set -e
-          # Đúng quy trình của vendor: merge gki_defconfig + sprd_gki_sharkl6.fragment
+          # Matches the vendor build.config: merge gki_defconfig + sprd_gki_sharkl6.fragment
+          # The result is written directly into arch/arm64/configs/ums9230_gki_defconfig
+          # (this is what `make ums9230_gki_defconfig` later consumes).
           KCONFIG_CONFIG=arch/arm64/configs/ums9230_gki_defconfig \
             ./scripts/kconfig/merge_config.sh -m -r \
               arch/arm64/configs/gki_defconfig \
               arch/arm64/configs/sprd_gki_sharkl6.fragment \
               > /tmp/merge.log 2>&1 || { echo "merge failed"; tail -50 /tmp/merge.log; exit 1; }
           echo "merge_config done"
+          tail -30 /tmp/merge.log
 
       - name: Apply OC + thermal-disable patch
         env:
@@ -140,8 +145,11 @@ jobs:
           set -e
           export PATH="/opt/clang/bin:${PATH}"
           export LLVM=1 ARCH=arm64
+          # Generate .config from the merged defconfig
           make O=out ARCH=arm64 LLVM=1 ums9230_gki_defconfig
+          # Build the kernel image
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz
+          # Build the sprd cpufreq module from the patched source
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) M=drivers/cpufreq
           echo "=== build artifacts ==="
           ls -la out/arch/arm64/boot/Image.gz
@@ -150,10 +158,11 @@ jobs:
       - name: Pack boot image (optional, uses STOCK dtb.img if present)
         run: |
           set -e
-          # OC chỉ thay đổi kernel image + module; device tree (dtb/dtbo) KHÔNG đổi.
-          # Kernel nguồn này là cây Realme (generic) KHÔNG có tuỳ chỉnh "serenity"
-          # của Redmi A5, nên KHÔNG build lại dtbo/dtb ở đây để tránh sai cây DT.
-          # OC được áp dụng thực tế bằng cách nạp module sprd-cpufreq-v2.ko (stock boot/dtbo giữ nguyên).
+          # OC only changes the kernel image + cpufreq module; the device tree
+          # (dtb/dtbo) is UNCHANGED. This kernel source is the Realme (generic)
+          # UMS9230 tree WITHOUT the Redmi A5 "serenity" customization, so we
+          # must NOT rebuild dtbo/dtb here. The stock boot/dtbo stays untouched;
+          # the OC itself is applied by loading the patched sprd-cpufreq-v2.ko.
           if [ -f prebuilts/dtb.img ]; then
             mkbootimg \
               --kernel out/arch/arm64/boot/Image.gz \
@@ -168,7 +177,7 @@ jobs:
               -o out/boot.img
             ls -la out/boot.img
           else
-            echo "SKIP: chưa có prebuilts/dtb.img (dtb stock serenity) trong repo. Chỉ upload Image.gz + module."
+            echo "SKIP: no prebuilts/dtb.img (stock serenity dtb) found in repo. Uploading Image.gz + module only."
           fi
 
       - name: Package Magisk module (flashable zip)
@@ -176,80 +185,98 @@ jobs:
           OC_FREQ_MHZ: ${{ github.event.inputs.oc_freq }}
         run: |
           set -e
-          # Tạo Magisk module boot-safe: chỉ nạp ko patched lúc boot, KHÔNG đụng
-          # kernel/boot/dtbo → gỡ module (hoặc insmod fail) = trả về stock, không bootloop.
+          # Build a boot-safe Magisk module that loads the patched ko at boot.
+          # It NEVER touches kernel/boot/dtbo, so uninstalling the module (or the
+          # insmod failing) fully restores stock; it cannot cause a boot loop.
           MDIR=magisk_module
           rm -rf "$MDIR"
           mkdir -p "$MDIR"
           cp out/drivers/cpufreq/sprd-cpufreq-v2.ko "$MDIR/"
 
           cat > "$MDIR/module.prop" << EOF
-id=oc-cpufreq-ums9230
-name=OC CPUFreq UMS9230 (Redmi A5)
-version=${OC_FREQ_MHZ}MHz
-versionCode=${OC_FREQ_MHZ}
-author=local
-description=Load patched sprd-cpufreq-v2.ko cho ${OC_FREQ_MHZ}MHz OC + tắt thermal Redmi A5. An toàn: không đổi kernel/boot/dtbo. Giữ Vol-Down lúc boot hoặc tạo \$MODDIR/disable để bỏ qua.
-EOF
+          id=oc-cpufreq-ums9230
+          name=OC CPUFreq UMS9230 (Redmi A5)
+          version=${OC_FREQ_MHZ}MHz
+          versionCode=${OC_FREQ_MHZ}
+          author=local
+          description=Load patched sprd-cpufreq-v2.ko for ${OC_FREQ_MHZ}MHz OC + thermal-disable on Redmi A5. Safe: no kernel/boot/dtbo changed. Hold Volume-Down at boot or create \$MODDIR/disable to skip.
+          EOF
 
           cat > "$MDIR/service.sh" << 'SHEOF'
-#!/system/bin/sh
-MODDIR=${0%/*}
-LOG=/data/local/tmp/oc_cpufreq.log
-trap 'echo "[oc] error, boot continues" >> $LOG; exit 0' ERR
-echo "[oc] $(date '+%F %T') start" >> $LOG
-# 1) Tắt tay: tạo $MODDIR/disable
-if [ -f "$MODDIR/disable" ]; then
-  echo "[oc] disabled by marker file" >> $LOG
-  exit 0
-fi
-# 2) An toàn: giữ Vol-Down lúc boot để boot stock
-if command -v getevent >/dev/null 2>&1; then
-  if getevent -lc 3 2>/dev/null | grep -q "KEY_VOLUMEDOWN"; then
-    echo "[oc] Volume-Down held -> OC skipped (stock boot)" >> $LOG
-    exit 0
-  fi
-fi
-# 3) Nếu ko đã load thì thôi
-if grep -qs "^sprd_cpufreq_v2 " /proc/modules; then
-  echo "[oc] sprd_cpufreq_v2 already loaded" >> $LOG
-  exit 0
-fi
-# 4) Gỡ bản stock (nếu có) — fail thì bỏ qua
-rmmod sprd_cpufreq_v2 2>>$LOG || true
-# 5) Nạp ko patched; fail thì cố khôi phục stock rồi tiếp tục boot
-if insmod "$MODDIR/sprd-cpufreq-v2.ko" 2>>$LOG; then
-  echo "[oc] insmod patched ko OK" >> $LOG
-else
-  echo "[oc] insmod FAILED -> OC inactive, device boots normally" >> $LOG
-  for STOCK in \
-    /vendor_dlkm/lib/modules/sprd-cpufreq-v2.ko \
-    /system_dlkm/lib/modules/sprd-cpufreq-v2.ko \
-    /vendor/lib/modules/sprd-cpufreq-v2.ko; do
-    if [ -f "$STOCK" ]; then
-      insmod "$STOCK" 2>>$LOG || true
-      break
-    fi
-  done
-fi
-exit 0
-SHEOF
+          #!/system/bin/sh
+          # Late_start service: load the patched sprd-cpufreq-v2.ko.
+          # Boot-safe design: this NEVER flashes kernel/boot/dtbo. If loading fails we
+          # simply skip, so the device always boots normally. No user system files touched.
+          MODDIR=${0%/*}
+          LOG=/data/local/tmp/oc_cpufreq.log
+
+          # Always return success so boot never blocks.
+          trap 'echo "[oc] error, boot continues" >> $LOG; exit 0' ERR
+          echo "[oc] $(date '+%F %T') start" >> $LOG
+
+          # 1) Manual disable: create $MODDIR/disable (via Magisk file manager or terminal)
+          if [ -f "$MODDIR/disable" ]; then
+            echo "[oc] disabled by marker file" >> $LOG
+            exit 0
+          fi
+
+          # 2) Volume-button safety: holding Vol-Down at boot skips OC (boots fully stock)
+          if command -v getevent >/dev/null 2>&1; then
+            if getevent -lc 3 2>/dev/null | grep -q "KEY_VOLUMEDOWN"; then
+              echo "[oc] Volume-Down held -> OC skipped (stock boot)" >> $LOG
+              exit 0
+            fi
+          fi
+
+          # 3) If our ko is already loaded, nothing to do.
+          if grep -qs "^sprd_cpufreq_v2 " /proc/modules; then
+            echo "[oc] sprd_cpufreq_v2 already loaded" >> $LOG
+            exit 0
+          fi
+
+          # 4) Try to unload a stock instance if present (ignore failure - driver may be in use)
+          rmmod sprd_cpufreq_v2 2>>$LOG || true
+
+          # 5) Load the patched ko. On failure, attempt to restore the stock ko, then continue.
+          if insmod "$MODDIR/sprd-cpufreq-v2.ko" 2>>$LOG; then
+            echo "[oc] insmod patched ko OK" >> $LOG
+          else
+            echo "[oc] insmod FAILED -> OC inactive, device boots normally" >> $LOG
+            for STOCK in \
+              /vendor_dlkm/lib/modules/sprd-cpufreq-v2.ko \
+              /system_dlkm/lib/modules/sprd-cpufreq-v2.ko \
+              /vendor/lib/modules/sprd-cpufreq-v2.ko; do
+              if [ -f "$STOCK" ]; then
+                insmod "$STOCK" 2>>$LOG || true
+                break
+              fi
+            done
+          fi
+
+          # 6) Confirm in log
+          grep -i "Adding custom OC OPP" /proc/kmsg /dev/kmsg 2>>$LOG || dmesg 2>/dev/null | grep -i "OC OPP" >>$LOG || true
+          exit 0
+          SHEOF
           chmod +x "$MDIR/service.sh"
 
+          # Build the flashable zip with python (std lib) to avoid extra deps.
           python3 - "$MDIR" << 'PYEOF'
-import sys, os, zipfile, stat
-mdir = sys.argv[1]
-out = "/tmp/oc-cpufreq-{}MHz-magisk.zip".format(os.environ.get("OC_FREQ_MHZ", "2220"))
-files = ["module.prop", "service.sh", "sprd-cpufreq-v2.ko"]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for f in files:
-        zi = zipfile.ZipInfo(f)
-        if f == "service.sh":
-            zi.external_attr = 0o100755 << 16
-        with open(os.path.join(mdir, f), "rb") as fh:
-            z.writestr(zi, fh.read())
-print("wrote " + out)
-PYEOF
+          import sys, os, zipfile
+          mdir = sys.argv[1]
+          out = "/tmp/oc-cpufreq-{}MHz-magisk.zip".format(os.environ.get("OC_FREQ_MHZ", "2220"))
+          files = ["module.prop", "service.sh", "sprd-cpufreq-v2.ko"]
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+              for f in files:
+                  p = os.path.join(mdir, f)
+                  import stat
+                  zi = zipfile.ZipInfo(f)
+                  with open(p, "rb") as fh:
+                      data = fh.read()
+                  if f == "service.sh":
+                      zi.external_attr = 0o100755 << 16
+                  z.writestr(zi, data)
+          print("wrote " + out)
+          PYEOF
           cp /tmp/oc-cpufreq-${OC_FREQ_MHZ}MHz-magisk.zip out/
           ls -la out/*.zip
 
