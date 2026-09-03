@@ -167,6 +167,8 @@ jobs:
             out/.config
           # Build the kernel image
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) Image.gz
+          # Prepare module-build infra (generates scripts/module.lds + Module.symvers)
+          make O=out ARCH=arm64 LLVM=1 -j$(nproc) modules_prepare
           # Build the sprd cpufreq module from the patched source
           make O=out ARCH=arm64 LLVM=1 -j$(nproc) M=drivers/cpufreq
           echo "=== build artifacts ==="
