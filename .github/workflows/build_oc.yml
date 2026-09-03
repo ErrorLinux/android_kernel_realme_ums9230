@@ -56,52 +56,55 @@ jobs:
           echo "merge_config done"
 
       - name: Apply OC + thermal-disable patch
+        env:
+          OC_FREQ_MHZ: ${{ github.event.inputs.oc_freq }}
+          OC_VOLT_MV: ${{ github.event.inputs.oc_volt }}
         run: |
           set -e
           python3 << 'PY'
-          freq_mhz = ${{ github.event.inputs.oc_freq }}
-          volt_mv   = ${{ github.event.inputs.oc_volt }}
+          import os
+          freq_mhz = int(os.environ["OC_FREQ_MHZ"])
+          volt_mv = int(os.environ["OC_VOLT_MV"])
           p = "drivers/cpufreq/sprd-cpufreq-v2-driver.c"
           s = open(p).read()
 
-          # 1) Overclock: thêm OPP 2220MHz vào big cluster (id==1)
           if "Adding custom OC OPP" not in s:
               anchor = "\tif (node->temp_table)\n\t\tpolicy->freq_table = node->temp_table;"
               assert anchor in s, "anchor 1 (temp_table) not found"
-              oc = """\t/* OC: force max freq/volt on the big cluster (Cortex-A75) */
-\tif (cluster->id == 1) {
-\t\tfreq = %d000000ULL;
-\t\tvol = %d000;
-\t\tpr_info("Adding custom OC OPP: %%lluHz/%%lluuV for big cluster\\n", freq, vol);
-\t\tif (policy->freq_table)
-\t\t\tdev_pm_opp_remove(cpu, freq);
-\t\tret = dev_pm_opp_add(cpu, freq, vol);
-\t\tif (ret)
-\t\t\tpr_err("add custom OC OPP %%lluHz/%%lluuV error(%%d)\\n", freq, vol, ret);
-\t\telse
-\t\t\tcluster->table_entry_num++;
-\t}
-
-""" % (freq_mhz, volt_mv)
+              marker = "Adding custom OC OPP"
+              oc = (
+                  "\t/* OC: force max freq/volt on the big cluster (Cortex-A75) */\n"
+                  "\tif (cluster->id == 1) {\n"
+                  "\t\tfreq = %dULL;\n" % (freq_mhz * 1000000)
+                  + "\t\tvol = %d;\n" % (volt_mv * 1000)
+                  + "\t\tpr_info(\"%s: %lluHz/%lluuV for big cluster\\n\", freq, vol);\n" % marker
+                  + "\t\tif (policy->freq_table)\n"
+                  + "\t\t\tdev_pm_opp_remove(cpu, freq);\n"
+                  + "\t\tret = dev_pm_opp_add(cpu, freq, vol);\n"
+                  + "\t\tif (ret)\n"
+                  + "\t\t\tpr_err(\"add custom OC OPP %lluHz/%lluuV error(%d)\\n\", freq, vol, ret);\n"
+                  + "\t\telse\n"
+                  + "\t\t\tcluster->table_entry_num++;\n"
+                  + "\t}\n\n"
+              )
               s = s.replace(anchor, oc + anchor, 1)
           else:
               print("OC block already present, skipping")
 
-          # 2) Tắt thermal throttling: vô hiệu hóa worker cập nhật theo nhiệt độ
           start = s.index("static void sprd_cpufreq_temp_work_func(struct work_struct *work)")
           end = s.index("/* sprd_cpufreq_driver interface */")
-          neutral = """static void sprd_cpufreq_temp_work_func(struct work_struct *work)
-{
-\tstruct delayed_work *dwork = to_delayed_work(work);
-\tstruct cluster_info *cluster =
-\t\tcontainer_of(dwork, struct cluster_info, temp_work);
-
-\t/* Thermal throttling disabled: do not downgrade DVFS by temperature. */
-\tif (cluster)
-\t\tpr_debug("cluster %u thermal throttling disabled\\n", cluster->id);
-}
-
-"""
+          neutral = (
+              "static void sprd_cpufreq_temp_work_func(struct work_struct *work)\n"
+              "{\n"
+              "\tstruct delayed_work *dwork = to_delayed_work(work);\n"
+              "\tstruct cluster_info *cluster =\n"
+              "\t\tcontainer_of(dwork, struct cluster_info, temp_work);\n"
+              "\n"
+              "\t/* Thermal throttling disabled: do not downgrade DVFS by temperature. */\n"
+              "\tif (cluster)\n"
+              "\t\tpr_debug(\"cluster %u thermal throttling disabled\\n\", cluster->id);\n"
+              "}\n\n"
+          )
           s = s[:start] + neutral + s[end:]
 
           open(p, "w").write(s)
