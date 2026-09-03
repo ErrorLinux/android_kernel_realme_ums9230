@@ -38,16 +38,29 @@ jobs:
         run: |
           set -e
           mkdir -p /opt/clang
-          # clang-15 (r450784e) là toolchain đúng cho kernel android13-5.15 này
-          for REF in android13-release main master; do
-            if curl -fL --retry 3 --max-time 1800 -o /tmp/clang.tar.gz \
-                "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${REF}/clang-r450784e.tar.gz" 2>/dev/null; then
-              echo "fetched clang from branch ${REF}"
-              break
-            fi
+          # Kernel build.config.constants ghim CLANG_VERSION=r450784e, nhưng
+          # android.googlesource.com không còn phục vụ đúng build đó trên branch heads.
+          # Nhánh android13 vẫn phát hành clang-15 với hậu tố chữ tăng dần (r450784d, ...),
+          # đều là toolchain tương đương. Thử nhiều branch/version cho tới khi tải được.
+          FOUND=0
+          for REF in android13-release llvm-r450784 android13-qpr1-release android13-qpr2-release; do
+            for VER in r450784e r450784d r450784c r450784b; do
+              echo "trying ${REF}: clang-${VER}"
+              if curl -fL --retry 3 --max-time 1700 -o /tmp/clang.tar.gz \
+                  "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${REF}/clang-${VER}.tar.gz" 2>/dev/null; then
+                if tar -tzf /tmp/clang.tar.gz >/dev/null 2>&1; then
+                  echo "fetched clang ${VER} from branch ${REF}"
+                  FOUND=1
+                  break 2
+                fi
+              fi
+            done
           done
-          test -s /tmp/clang.tar.gz || { echo "clang download failed"; exit 1; }
+          [ "$FOUND" = "1" ] || { echo "clang download failed"; exit 1; }
           tar -xzf /tmp/clang.tar.gz -C /opt/clang
+          # Cập nhật CLANG_VERSION cho khớp với build đã tải.
+          sed -i 's/^CLANG_VERSION=.*/CLANG_VERSION=r450784d/' build.config.constants
+          ls /opt/clang/bin
           test -x /opt/clang/bin/clang || { echo "clang not found in bundle"; exit 1; }
 
       - name: Merge defconfig + fragment into ums9230_gki_defconfig
