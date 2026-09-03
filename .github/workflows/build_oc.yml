@@ -84,6 +84,11 @@ jobs:
           # không hề ảnh hưởng. Bỏ bước link nặng -> build nhanh và chắc chắn kịp giờ.
           sed -i 's/^CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_NONE=y/' arch/arm64/configs/ums9230_gki_defconfig
           grep -n "CONFIG_LTO" arch/arm64/configs/ums9230_gki_defconfig || true
+          # BTF cần công cụ pahole (không có sẵn trên runner) -> tắt CONFIG_DEBUG_INFO_BTF
+          # để build khỏi lỗi "pahole is not available". BTF chỉ phục vụ eBPF, không liên quan OC.
+          sed -i 's/^CONFIG_DEBUG_INFO_BTF=y/# CONFIG_DEBUG_INFO_BTF is not set/' arch/arm64/configs/ums9230_gki_defconfig
+          sed -i 's/^CONFIG_MODULE_ALLOW_BTF_MISMATCH=y/# CONFIG_MODULE_ALLOW_BTF_MISMATCH is not set/' arch/arm64/configs/ums9230_gki_defconfig
+          grep -n "BTF" arch/arm64/configs/ums9230_gki_defconfig || true
 
       - name: Apply OC + thermal-disable patch
         env:
